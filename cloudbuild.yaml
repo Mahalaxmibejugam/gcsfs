@@ -12,7 +12,7 @@ steps:
       - "create"
       - "gs://gcsfs-test-standard-${SHORT_SHA}"
       - "--project=${PROJECT_ID}"
-      - "--location=${_ZONE}"
+      - "--location=${_REGION}"
     waitFor: ["-"]
 
   # Step 2: Create a unique HNS-enabled GCS bucket for the test run.
