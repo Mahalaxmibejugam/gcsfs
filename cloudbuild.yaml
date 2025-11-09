@@ -26,6 +26,7 @@ steps:
       - "--project=${PROJECT_ID}"
       - "--location=${_REGION}"
       - "--enable-hierarchical-namespace"
+      - "--uniform-bucket-level-access"
     waitFor: ["-"]
 
   # Step 3: Create a GCE VM to run the tests.
