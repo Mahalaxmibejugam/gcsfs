@@ -11,7 +11,7 @@ steps:
       - "buckets"
       - "create"
       - "gs://gcsfs-test-standard-${SHORT_SHA}"
-      - "--project=${_PROJECT_ID}"
+      - "--project=${PROJECT_ID}"
       - "--location=${_ZONE}"
     waitFor: ["-"]
 
@@ -23,7 +23,7 @@ steps:
       - "buckets"
       - "create"
       - "gs://gcsfs-test-hns-${SHORT_SHA}"
-      - "--project=${_PROJECT_ID}"
+      - "--project=${PROJECT_ID}"
       - "--location=${_REGION}"
       - "--enable-hierarchical-namespace"
     waitFor: ["-"]
@@ -38,7 +38,7 @@ steps:
       - "instances"
       - "create"
       - "gcsfs-test-vm-${SHORT_SHA}"
-      - "--project=${_PROJECT_ID}"
+      - "--project=${PROJECT_ID}"
       - "--zone=${_ZONE}"
       - "--machine-type=e2-medium"
       - "--image-family=debian-11"
