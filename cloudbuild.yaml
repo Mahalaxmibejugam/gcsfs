@@ -2,6 +2,7 @@ substitutions:
   _REGION: "us-central1"
   _ZONE: "us-central1-a"
   _SHORT_BUILD_ID: ${BUILD_ID:0:8}
+  _VM_SERVICE_ACCOUNT: ${_SERVICE_ACCOUNT}
 
 steps:
   # Step 1: Create a unique standard GCS bucket for the test run.
@@ -46,6 +47,7 @@ steps:
       - "--image-family=debian-11"
       - "--image-project=debian-cloud"
       - "--no-address"
+      - "--service-account=${_VM_SERVICE_ACCOUNT}"
       - "--scopes=https://www.googleapis.com/auth/cloud-platform" # Full access to project APIs
     waitFor: ["-"]
 
