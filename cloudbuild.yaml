@@ -1,6 +1,7 @@
 substitutions:
   _REGION: "us-central1"
   _ZONE: "us-central1-a"
+  _SHORT_BUILD_ID: ${BUILD_ID:0:8}
 
 steps:
   # Step 1: Create a unique standard GCS bucket for the test run.
@@ -10,7 +11,7 @@ steps:
       - "storage"
       - "buckets"
       - "create"
-      - "gs://gcsfs-test-standard-${SHORT_SHA}"
+      - "gs://gcsfs-test-standard-${_SHORT_BUILD_ID}"
       - "--project=${PROJECT_ID}"
       - "--location=${_REGION}"
     waitFor: ["-"]
@@ -22,7 +23,7 @@ steps:
       - "storage"
       - "buckets"
       - "create"
-      - "gs://gcsfs-test-hns-${SHORT_SHA}"
+      - "gs://gcsfs-test-hns-${_SHORT_BUILD_ID}"
       - "--project=${PROJECT_ID}"
       - "--location=${_REGION}"
       - "--enable-hierarchical-namespace"
@@ -38,7 +39,7 @@ steps:
       - "compute"
       - "instances"
       - "create"
-      - "gcsfs-test-vm-${SHORT_SHA}"
+      - "gcsfs-test-vm-${_SHORT_BUILD_ID}"
       - "--project=${PROJECT_ID}"
       - "--zone=${_ZONE}"
       - "--machine-type=e2-medium"
@@ -58,7 +59,7 @@ steps:
         set -e
         # Wait for the VM to be fully initialized and SSH to be ready.
         for i in {1..10}; do
-          if gcloud compute ssh gcsfs-test-vm-${SHORT_SHA} --zone=${_ZONE} --command="echo VM is ready"; then
+          if gcloud compute ssh gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --command="echo VM is ready"; then
             break
           fi
           echo "Waiting for VM to become available... (attempt $$i/10)"
@@ -89,8 +90,8 @@ steps:
           pip install -e .
 
           echo '--- Preparing test environment on VM ---'
-          export GCSFS_TEST_BUCKET='gcsfs-test-standard-${SHORT_SHA}'
-          export GCSFS_HNS_TEST_BUCKET='gcsfs-test-hns-${SHORT_SHA}'
+          export GCSFS_TEST_BUCKET='gcsfs-test-standard-${_SHORT_BUILD_ID}'
+          export GCSFS_HNS_TEST_BUCKET='gcsfs-test-hns-${_SHORT_BUILD_ID}'
 
           echo 'Standard Bucket: $$GCSFS_TEST_BUCKET'
           echo 'HNS Bucket: $$GCSFS_HNS_TEST_BUCKET'
@@ -100,7 +101,7 @@ steps:
         "
 
         # Execute the script on the VM via SSH.
-        gcloud compute ssh gcsfs-test-vm-${SHORT_SHA} --zone=${_ZONE} --command="$$VM_SCRIPT"
+        gcloud compute ssh gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --command="$$VM_SCRIPT"
     waitFor:
       - "create-vm"
       - "create-standard-bucket"
@@ -117,7 +118,7 @@ steps:
       - "compute"
       - "instances"
       - "delete"
-      - "gcsfs-test-vm-${SHORT_SHA}"
+      - "gcsfs-test-vm-${_SHORT_BUILD_ID}"
       - "--zone=${_ZONE}"
       - "--quiet"
     waitFor:
@@ -127,14 +128,20 @@ steps:
   - name: "gcr.io/cloud-builders/gcloud"
     id: "delete-standard-bucket"
     args:
-      ["storage", "rm", "--recursive", "gs://gcsfs-test-standard-${SHORT_SHA}"]
+      [
+        "storage",
+        "rm",
+        "--recursive",
+        "gs://gcsfs-test-standard-${_SHORT_BUILD_ID}",
+      ]
     waitFor:
       - "run-tests-on-vm"
 
   # Step 7: Delete the HNS GCS bucket.
   - name: "gcr.io/cloud-builders/gcloud"
     id: "delete-hns-bucket"
-    args: ["storage", "rm", "--recursive", "gs://gcsfs-test-hns-${SHORT_SHA}"]
+    args:
+      ["storage", "rm", "--recursive", "gs://gcsfs-test-hns-${_SHORT_BUILD_ID}"]
     waitFor:
       - "run-tests-on-vm"
 
