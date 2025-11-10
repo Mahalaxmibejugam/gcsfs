@@ -45,6 +45,7 @@ steps:
       - "--machine-type=e2-medium"
       - "--image-family=debian-11"
       - "--image-project=debian-cloud"
+      - "--no-address"
       - "--scopes=https://www.googleapis.com/auth/cloud-platform" # Full access to project APIs
     waitFor: ["-"]
 
