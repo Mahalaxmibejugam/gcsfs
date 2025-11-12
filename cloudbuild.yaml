@@ -5,8 +5,9 @@ substitutions:
 
 steps:
   # Step 1: Create a unique standard GCS bucket for the test run.
-  - name: "gcr.io/cloud-builders/gcloud"
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: "create-standard-bucket"
+    entrypoint: "gcloud"
     args:
       - "storage"
       - "buckets"
@@ -17,8 +18,9 @@ steps:
     waitFor: ["-"]
 
   # Step 2: Create a unique HNS-enabled GCS bucket for the test run.
-  - name: "gcr.io/cloud-builders/gcloud"
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: "create-hns-bucket"
+    entrypoint: "gcloud"
     args:
       - "storage"
       - "buckets"
@@ -33,8 +35,9 @@ steps:
   # Step 3: Create a GCE VM to run the tests.
   # The VM is created in the same zone as the buckets to test zonal bucket features.
   # It's given the 'cloud-platform' scope to allow it to access GCS and other services.
-  - name: "gcr.io/cloud-builders/gcloud"
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: "create-vm"
+    entrypoint: "gcloud"
     args:
       - "compute"
       - "instances"
@@ -52,7 +55,7 @@ steps:
 
   # Step 4: Run the integration tests inside the newly created VM.
   # This step uses 'gcloud compute ssh' to execute a remote script.
-  - name: "gcr.io/cloud-builders/gcloud"
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: "run-tests-on-vm"
     entrypoint: "bash"
     args:
@@ -114,8 +117,9 @@ steps:
   # to ensure resources are not left orphaned.
 
   # Step 5: Delete the GCE VM.
-  - name: "gcr.io/cloud-builders/gcloud"
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: "delete-vm"
+    entrypoint: "gcloud"
     args:
       - "compute"
       - "instances"
@@ -127,8 +131,9 @@ steps:
       - "run-tests-on-vm"
 
   # Step 6: Delete the standard GCS bucket.
-  - name: "gcr.io/cloud-builders/gcloud"
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: "delete-standard-bucket"
+    entrypoint: "gcloud"
     args:
       [
         "storage",
@@ -140,8 +145,9 @@ steps:
       - "run-tests-on-vm"
 
   # Step 7: Delete the HNS GCS bucket.
-  - name: "gcr.io/cloud-builders/gcloud"
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: "delete-hns-bucket"
+    entrypoint: "gcloud"
     args:
       ["storage", "rm", "--recursive", "gs://gcsfs-test-hns-${_SHORT_BUILD_ID}"]
     waitFor:
