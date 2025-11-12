@@ -61,7 +61,7 @@ steps:
         set -e
         # Wait for the VM to be fully initialized and SSH to be ready.
         for i in {1..10}; do
-          if gcloud compute ssh gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --command="echo VM is ready"; then
+          if gcloud compute ssh gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --internal-ip --command="echo VM is ready"; then
             break
           fi
           echo "Waiting for VM to become available... (attempt $$i/10)"
@@ -103,7 +103,7 @@ steps:
         "
 
         # Execute the script on the VM via SSH.
-        gcloud compute ssh gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --command="$$VM_SCRIPT"
+        gcloud compute ssh gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --internal-ip --command="$$VM_SCRIPT"
     waitFor:
       - "create-vm"
       - "create-standard-bucket"
@@ -151,3 +151,5 @@ timeout: "1800s" # 30 minutes
 
 options:
   logging: CLOUD_LOGGING_ONLY
+  pool:
+    name: "projects/${PROJECT_ID}/locations/us-central1/workerPools/cloud-build-worker-pool"
