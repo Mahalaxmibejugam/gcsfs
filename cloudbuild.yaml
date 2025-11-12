@@ -47,6 +47,7 @@ steps:
       - "--image-project=debian-cloud"
       - "--no-address"
       - "--service-account=${_SERVICE_ACCOUNT}"
+      - "--tags=allow-ssh"
       - "--scopes=https://www.googleapis.com/auth/cloud-platform" # Full access to project APIs
     waitFor: ["-"]
 
