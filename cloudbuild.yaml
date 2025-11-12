@@ -53,6 +53,20 @@ steps:
       - "--scopes=https://www.googleapis.com/auth/cloud-platform" # Full access to project APIs
     waitFor: ["-"]
 
+  # Step 3a: Get the internal IP of the created VM.
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "get-vm-ip"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        gcloud compute instances describe gcsfs-test-vm-${_SHORT_BUILD_ID} \
+          --project=${PROJECT_ID} \
+          --zone=${_ZONE} \
+          --format='get(networkInterfaces[0].networkIP)' --no-user-output-enabled > vm_ip.txt
+    waitFor:
+      - "create-vm"
+
   # Step 4: Run the integration tests inside the newly created VM.
   # This step uses 'gcloud compute ssh' to execute a remote script.
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
@@ -62,9 +76,11 @@ steps:
       - "-c"
       - |
         set -e
+        VM_IP=$(cat vm_ip.txt)
+        echo "--- VM Internal IP: $$VM_IP ---"
         # Wait for the VM to be fully initialized and SSH to be ready.
         for i in {1..10}; do
-          if gcloud compute ssh gcp_${PROJECT_NUMBER}@gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --internal-ip --command="echo VM is ready"; then
+          if gcloud compute ssh "gcp_${PROJECT_NUMBER}@$$VM_IP" --zone=${_ZONE} --internal-ip --command="echo VM is ready"; then
             break
           fi
           echo "Waiting for VM to become available... (attempt $$i/10)"
@@ -106,11 +122,11 @@ steps:
         "
 
         # Execute the script on the VM via SSH.
-        gcloud compute ssh gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --internal-ip --command="$$VM_SCRIPT"
+        gcloud compute ssh "$$VM_IP" --zone=${_ZONE} --internal-ip --command="$$VM_SCRIPT"
     waitFor:
-      - "create-vm"
       - "create-standard-bucket"
       - "create-hns-bucket"
+      - "get-vm-ip"
 
   # --- Cleanup Steps ---
   # These steps will run after the test step, regardless of its success or failure,
