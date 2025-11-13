@@ -64,7 +64,7 @@ steps:
         set -e
         # Wait for the VM to be fully initialized and SSH to be ready.
         for i in {1..10}; do
-          if gcloud compute ssh gcp_${PROJECT_NUMBER}@gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --internal-ip --tunnel-through-iap --quiet command="echo VM is ready"; then
+          if gcloud compute ssh gcp_${PROJECT_NUMBER}@gcsfs-test-vm-${_SHORT_BUILD_ID} --zone=${_ZONE} --internal-ip --tunnel-through-iap --quiet --command="echo VM is ready"; then
             break
           fi
           echo "Waiting for VM to become available... (attempt $$i/10)"
