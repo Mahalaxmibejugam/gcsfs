@@ -81,7 +81,7 @@ steps:
           sudo apt-get install -y git python3-pip python3-venv
 
           # Clone the repository and checkout the specific commit from the build trigger.
-          git clone https://github.com/fsspec/gcsfs.git
+          git clone https://github.com/Mahalaxmibejugam/gcsfs.git
           cd gcsfs
           git checkout ${COMMIT_SHA}
 
@@ -103,7 +103,10 @@ steps:
           echo 'HNS Bucket: $$GCSFS_HNS_TEST_BUCKET'
 
           echo '--- Running pytest on VM ---'
-          pytest -v gcsfs/tests/
+          pytest -vv -s \
+          --log-format="%(asctime)s %(levelname)s %(message)s" \
+          --log-date-format="%H:%M:%S" \
+          gcsfs/
         "
 
         # Execute the script on the VM via SSH.
