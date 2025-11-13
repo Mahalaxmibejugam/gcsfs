@@ -101,9 +101,6 @@ steps:
 
           export STORAGE_EMULATOR_HOST=https://storage.googleapis.com
           
-          echo "Standard Bucket: $GCSFS_TEST_BUCKET"
-          echo "HNS Bucket: $GCSFS_HNS_TEST_BUCKET"
-
           echo '--- Running pytest on VM ---'
           pytest -vv -s \
           --log-format='%(asctime)s %(levelname)s %(message)s' \
