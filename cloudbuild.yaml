@@ -72,7 +72,7 @@ steps:
           sleep 15
         done
 
-        # Define the script to be executed on the VM.
+        # Script to be executed on the VM.
         # This script installs dependencies, sets environment variables, and runs pytest.
         VM_SCRIPT="
           set -e
@@ -104,8 +104,8 @@ steps:
 
           echo '--- Running pytest on VM ---'
           pytest -vv -s \
-          --log-format="%(asctime)s %(levelname)s %(message)s" \
-          --log-date-format="%H:%M:%S" \
+          --log-format='%(asctime)s %(levelname)s %(message)s' \
+          --log-date-format='%H:%M:%S' \
           gcsfs/
         "
 
