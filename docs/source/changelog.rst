@@ -4,6 +4,45 @@ Changelog
 Note: in some releases, there are no changes, because we always guarantee
 releasing in step with fsspec.
 
+2026.4.0
+--------
+
+* add fallback when missing __version__ (#826)
+* use project ID in gRPC, if set (#825)
+* fix location lookup in put_file (#821)
+* error message formatting in rm_files (#820)
+* requestor pays in ExtendedGcs (#817)
+* logging error->warning in storage layout API (#816)
+* fix prefetcher docs (#815)
+* cleanup on failure in cloud build benchmarks (#812)
+* benchmark updates (#812, 811, 810, 802)
+* migrate setuptools to hatch (#809)
+* retreive coroutine exceptions (#807)
+* honour NO_GCE_CHECK (#803)
+* update README (#801)
+* use moveTo in standard buckets (#800)
+* typos (#798, 796, 794)
+* prefetcher for standard buckets (#795)
+
+2026.3.0
+--------
+
+**Support for Rapid and hierarchical buckets is moved from opt-in to default.**
+**The default implementation is now ExtendedGcsFileSystem**. This still
+defers to GCSFileSystem for operations on "normal" buckets (i.e., not
+zonal, rapid, hierarchical). Set GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT to
+disable.
+
+* docs for zonal/rapid storage support (#792, 788, 781)
+* test/ci/cov fixes (#785, 772, 766, 765, 764)
+* fix zonalfile writes to track byte count (#777)
+* benchmarks (#775, 770, 767, 762)
+* fix folder rename race (HNS) (#771)
+* create zonal buckets (#769)
+* graceful close (#763)
+* list: pass only valid kwargs (#759)
+* make mv_file atomic (#758)
+
 2026.2.0
 --------
 

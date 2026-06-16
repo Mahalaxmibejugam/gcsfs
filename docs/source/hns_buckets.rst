@@ -53,10 +53,11 @@ Important Differences to Keep in Mind
 While ``gcsfs`` aims to abstract the differences via the ``fsspec`` API, you should be aware of standard HNS limitations imposed by the Google Cloud Storage API:
 
 1. **Implicit directories:** In standard GCS, you can create an object ``a/b/c.txt`` without the directories ``a/`` or ``a/b/`` physically existing. In HNS, the parent folder resources must exist (or be created) before the object can be written. ``gcsfs`` handles parent folder creation natively under the hood.
-2. **``mkdir`` behavior:** Previously, in a flat namespace, calling ``mkdir`` on a path could only ensure the underlying bucket exists. With HNS enabled, calling ``mkdir`` will create an actual folder resource in GCS. Furthermore, if you want to create nested folders (eg: bucket/a/b/c/d) pass ``create_parents=True``, it will physically create all intermediate folder resources along the specified path.
+2. **``mkdir`` behavior:** Previously, in a flat namespace, calling ``mkdir`` on a path could only ensure the underlying bucket exists. With HNS enabled, calling ``mkdir`` will create an actual folder resource in GCS. Furthermore, if you want to create nested folders (eg: bucket/a/b/c/d), pass ``create_parents=True``, it will physically create all intermediate folder resources along the specified path.
 3. **No mixing or toggling:** You cannot toggle HNS on an existing flat-namespace bucket. You must create a new HNS bucket and migrate your data.
 4. **Object naming:** Object names in HNS cannot end with a slash (``/``) unless without the creation of physical folder resources.
-5. **Rename Operation Benchmarks**
+5. **Non-Recursive Wildcard Deletions:** When using wildcard deletions without recursion (e.g., ``gcs.rm("bucket/dir/*", recursive=False)``), if the pattern matches a non-empty directory, HNS buckets will raise an error (typically surfaced as an ``OSError`` due to a failed precondition). In contrast, standard flat-namespace buckets silently ignore non-empty directories under the same circumstances.
+6. **Rename Operation Benchmarks**
 
 The following benchmarks show the time taken (in seconds) to rename a directory containing a large number of files (spread across 256 folders and 8 levels) in a standard Regional bucket versus an HNS bucket (can be replicated using `gcsfs/tests/perf/microbenchmarks/rename`):
 
@@ -74,6 +75,17 @@ The following benchmarks show the time taken (in seconds) to rename a directory 
      - 23.2
 
 For more details on managing these buckets, refer to the official documentation for `Hierarchical Namespace <https://cloud.google.com/storage/docs/hns-overview>`_.
+
+.. _bucket-type-detection-and-caching:
+
+Bucket Type Detection and Caching
+---------------------------------
+
+Before routing directory-level or file-level operations, the ``ExtendedGcsFileSystem`` performs a bucket type detection query via the Cloud Storage Control API's ``get_storage_layout`` method to determine if the bucket is HNS-enabled or Zonal.
+
+* **Success Caching:** Once the bucket type is successfully determined, the filesystem caches this layout type to avoid repeated API lookup overhead for subsequent operations.
+* **Non-Caching of UNKNOWN:** If the bucket type detection returns ``UNKNOWN`` (for instance, due to transient network failures), it is **intentionally not cached**. This ensures that transient lookup failures do not permanently degrade HNS or Zonal performance.
+* **Fallback Behavior:** If the bucket type is flagged as ``UNKNOWN``, the filesystem gracefully falls back to standard flat-namespace GCS operations without raising an error. The filesystem will retry the lookup on subsequent requests, allowing it to automatically adopt HNS/Zonal optimizations if the issue resolves.
 
 Disabling HNS Support
 ------------------------------

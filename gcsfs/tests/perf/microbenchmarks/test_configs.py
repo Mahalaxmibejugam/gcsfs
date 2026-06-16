@@ -4,6 +4,7 @@ import pytest
 
 from gcsfs.tests.perf.microbenchmarks import configs
 from gcsfs.tests.perf.microbenchmarks.delete.configs import get_delete_benchmark_cases
+from gcsfs.tests.perf.microbenchmarks.glob.configs import get_glob_benchmark_cases
 from gcsfs.tests.perf.microbenchmarks.info.configs import (
     InfoConfigurator,
     get_info_benchmark_cases,
@@ -12,14 +13,16 @@ from gcsfs.tests.perf.microbenchmarks.listing.configs import (
     ListingConfigurator,
     get_listing_benchmark_cases,
 )
-from gcsfs.tests.perf.microbenchmarks.read_fixed_duration.configs import (
-    ReadFixedDurationConfigurator,
-    get_read_fixed_duration_benchmark_cases,
+from gcsfs.tests.perf.microbenchmarks.open.configs import get_open_benchmark_cases
+from gcsfs.tests.perf.microbenchmarks.read.configs import (
+    ReadConfigurator,
+    get_read_benchmark_cases,
 )
 from gcsfs.tests.perf.microbenchmarks.rename.configs import get_rename_benchmark_cases
-from gcsfs.tests.perf.microbenchmarks.write_fixed_duration.configs import (
-    WriteFixedDurationConfigurator,
-    get_write_fixed_duration_benchmark_cases,
+from gcsfs.tests.perf.microbenchmarks.runner import filter_test_cases
+from gcsfs.tests.perf.microbenchmarks.write.configs import (
+    WriteConfigurator,
+    get_write_benchmark_cases,
 )
 
 MB = 1024 * 1024
@@ -76,22 +79,55 @@ def test_read_configurator(mock_config_dependencies):
     common = {
         "bucket_types": ["regional"],
         "file_sizes_mb": [1],
-        "block_sizes_mb": [16],
+        "chunk_sizes_mb": [16],
         "rounds": 1,
     }
-    scenario = {"name": "read_test", "processes": [1], "threads": [1], "pattern": "seq"}
+    scenario = {
+        "name": "read_test",
+        "processes": [1],
+        "threads": [1],
+        "pattern": "seq",
+        "block_sizes_mb": [16],
+    }
 
-    configurator = ReadFixedDurationConfigurator("dummy")
+    configurator = ReadConfigurator("dummy")
     cases = configurator.build_cases(scenario, common)
 
     assert len(cases) == 1
     case = cases[0]
-    assert case.name == "read_test_1procs_1threads_1MB_file_16MB_block_regional"
+    assert (
+        case.name
+        == "read_test_mrd_pool_cache_16_mrd_pool_None_1procs_1threads_1MB_file_16MB_chunk_16MB_block_regional"
+    )
     assert case.file_size_bytes == 1 * MB
-    assert case.block_size_bytes == 5 * MB
+    assert case.block_size_bytes == 16 * MB
     assert case.chunk_size_bytes == 16 * MB
     assert case.pattern == "seq"
     assert case.bucket_name == "test-bucket"
+
+
+def test_read_fixed_duration_multi_thread_config(mock_config_dependencies):
+    """Test that read fixed-duration multi-thread cases are generated and classified."""
+    with mock.patch("gcsfs.tests.perf.microbenchmarks.configs.BENCHMARK_FILTER", ""):
+        cases = get_read_benchmark_cases()
+
+    _, multi_thread_cases, _ = filter_test_cases(cases)
+    multi_thread_cases = [
+        case
+        for case in multi_thread_cases
+        if case.name.startswith("read_seq_fixed_duration_multi_thread")
+        or case.name.startswith("read_rand_fixed_duration_multi_thread")
+    ]
+
+    names = {case.name for case in multi_thread_cases}
+    assert any(
+        name.startswith("read_seq_fixed_duration_multi_thread") for name in names
+    )
+    assert any(
+        name.startswith("read_rand_fixed_duration_multi_thread") for name in names
+    )
+    assert {case.threads for case in multi_thread_cases} == {32}
+    assert {case.files for case in multi_thread_cases} == {1}
 
 
 def test_write_configurator(mock_config_dependencies):
@@ -99,19 +135,24 @@ def test_write_configurator(mock_config_dependencies):
     common = {
         "bucket_types": ["regional"],
         "chunk_sizes_mb": [10],
+        "block_sizes_mb": [32],
         "rounds": 1,
         "runtime": 30,
     }
     scenario = {"name": "write_test", "processes": [2], "threads": [1]}
 
-    configurator = WriteFixedDurationConfigurator("dummy")
+    configurator = WriteConfigurator("dummy")
     cases = configurator.build_cases(scenario, common)
 
     assert len(cases) == 1
     case = cases[0]
-    assert case.name == "write_test_2procs_1threads_10MB_chunk_regional_30s_duration"
+    assert (
+        case.name
+        == "write_test_2procs_1threads_10MB_chunk_32MB_block_regional_30s_duration"
+    )
     assert case.file_size_bytes == 0
     assert case.chunk_size_bytes == 10 * MB
+    assert case.block_size_bytes == 32 * MB
     assert case.processes == 2
     assert case.files == 2  # threads * processes
 
@@ -146,14 +187,16 @@ def test_listing_configurator(mock_config_dependencies):
 
 def test_info_configurator(mock_config_dependencies):
     """Test that InfoConfigurator correctly builds benchmark parameters."""
-    common = {"bucket_types": ["regional"], "files": [100], "folders": [1]}
+    common = {"bucket_types": ["regional"]}
     scenario = {
         "name": "info_test",
         "processes": [1],
         "threads": [1],
         "depth": 0,
         "pattern": "info",
-        "target_types": ["file"],
+        "target_type": "file",
+        "files": [100],
+        "folders": [1],
     }
 
     configurator = InfoConfigurator("dummy")
@@ -188,7 +231,7 @@ def test_generate_cases_calls_load(mock_config_dependencies):
         mock.patch("yaml.safe_load", return_value=config_content),
     ):
 
-        configurator = WriteFixedDurationConfigurator("dummy")
+        configurator = WriteConfigurator("dummy")
         cases = configurator.generate_cases()
         assert len(cases) == 1
         assert cases[0].name.startswith("test")
@@ -203,11 +246,11 @@ def test_validate_actual_yaml_configs():
     # Ensure BENCHMARK_FILTER is empty so we load all cases
     with mock.patch("gcsfs.tests.perf.microbenchmarks.configs.BENCHMARK_FILTER", ""):
         # Read
-        cases = get_read_fixed_duration_benchmark_cases()
+        cases = get_read_benchmark_cases()
         assert len(cases) > 0, "Read config produced no cases"
 
         # Write
-        cases = get_write_fixed_duration_benchmark_cases()
+        cases = get_write_benchmark_cases()
         assert len(cases) > 0, "Write config produced no cases"
 
         # Listing
@@ -225,3 +268,11 @@ def test_validate_actual_yaml_configs():
         # Info
         cases = get_info_benchmark_cases()
         assert len(cases) > 0, "Info config produced no cases"
+
+        # Open
+        cases = get_open_benchmark_cases()
+        assert len(cases) > 0, "Open config produced no cases"
+
+        # Glob
+        cases = get_glob_benchmark_cases()
+        assert len(cases) > 0, "Glob config produced no cases"

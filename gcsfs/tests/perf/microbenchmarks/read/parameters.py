@@ -4,7 +4,7 @@ from gcsfs.tests.perf.microbenchmarks.parameters import IOBenchmarkParameters
 
 
 @dataclass
-class ReadFixedDurationBenchmarkParameters(IOBenchmarkParameters):
+class ReadBenchmarkParameters(IOBenchmarkParameters):
     """
     Defines the parameters for a read benchmark test cases with runtime.
     """
@@ -17,3 +17,9 @@ class ReadFixedDurationBenchmarkParameters(IOBenchmarkParameters):
 
     # Time in seconds the test should run.
     runtime: int
+
+    # Size of the MRD pool cache. Default is 16.
+    mrd_pool_cache_size: int = 16
+
+    # Size of the MRD pool. Default is None.
+    mrd_pool_size: int | None = None
