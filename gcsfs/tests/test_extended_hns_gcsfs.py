@@ -4,6 +4,11 @@ Hierarchical Namespace (HNS) enabled features.
 
 These tests are designed to run with mocked GCS backends to isolate and verify
 the logic within the filesystem extension without making real API calls.
+
+Test placement: keep HNS-specific ExtendedGcsFileSystem tests here. Standard
+filesystem behavior belongs in test_core.py, pure dircache strategy tests belong
+in test_dircache.py, and zonal-specific filesystem routing belongs in
+test_zonal_file.py.
 """
 
 import contextlib
@@ -71,6 +76,7 @@ def gcs_hns_mocks():
         )
         patch_target_super_mv = "gcsfs.core.GCSFileSystem._mv"
         patch_target_super_mkdir = "gcsfs.core.GCSFileSystem._mkdir"
+        patch_target_super_makedirs = "gcsfs.core.GCSFileSystem._makedirs"
         patch_target_super_rmdir = "gcsfs.core.GCSFileSystem._rmdir"
         patch_target_super_find = "gcsfs.core.GCSFileSystem._find"
         patch_target_super_rm = "gcsfs.core.GCSFileSystem._rm"
@@ -101,6 +107,9 @@ def gcs_hns_mocks():
                 patch_target_super_mkdir, new_callable=mock.AsyncMock
             ) as mock_super_mkdir,
             mock.patch(
+                patch_target_super_makedirs, new_callable=mock.AsyncMock
+            ) as mock_super_makedirs,
+            mock.patch(
                 patch_target_super_rmdir, new_callable=mock.AsyncMock
             ) as mock_super_rmdir,
             mock.patch(
@@ -120,6 +129,7 @@ def gcs_hns_mocks():
                 "control_client": mock_control_client_instance,
                 "super_mv": mock_super_mv,
                 "super_mkdir": mock_super_mkdir,
+                "super_makedirs": mock_super_makedirs,
                 "super_rmdir": mock_super_rmdir,
                 "super_find": mock_super_find,
                 "super_rm": mock_super_rm,
@@ -671,6 +681,410 @@ class TestExtendedGcsFileSystemMvFile:
                 await gcsfs._mv_file_cache_update(path3, path4)
                 mock_super_update.assert_awaited_once_with(path3, path4, None)
 
+    @pytest.mark.asyncio
+    async def test_mv_file_hns_uncached_dest_parent_invalidates_dest_ancestors(self):
+        """Moving a file into a destination parent that is not cached (which the
+        move may have created) must invalidate the destination's ancestors,
+        while the source entry is still dropped in place."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        src_parent = f"{TEST_HNS_BUCKET}/src"
+        src = f"{src_parent}/a.txt"
+        dest_grandparent = f"{TEST_HNS_BUCKET}/destgp"
+        dest_parent = f"{dest_grandparent}/p"
+        dst = f"{dest_parent}/a.txt"
+
+        # Source parent cached (with the file); destination parent NOT cached,
+        # but a destination ancestor IS cached.
+        fs.dircache[src_parent] = [{"name": src, "type": "file"}]
+        fs.dircache[dest_grandparent] = [{"name": dest_parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": dest_grandparent, "type": "directory"}]
+
+        response = {"bucket": TEST_HNS_BUCKET, "name": "destgp/p/a.txt", "size": 5}
+        with mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=True):
+            await fs._mv_file_cache_update(src, dst, response)
+
+        # The source entry is dropped in place (removal never affects ancestors).
+        assert src not in [e["name"] for e in fs.dircache.get(src_parent, [])]
+        # The destination's ancestors are invalidated, since the move may have
+        # created dest_parent.
+        assert dest_grandparent not in fs.dircache
+        assert TEST_HNS_BUCKET not in fs.dircache
+
+    @pytest.mark.asyncio
+    async def test_mv_file_hns_replaces_cached_destination_entry(self):
+        """Moving a file over an already-cached destination must not leave
+        duplicate or stale destination entries in the parent listing."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        parent = f"{TEST_HNS_BUCKET}/parent"
+        src = f"{parent}/src.txt"
+        dst = f"{parent}/dst.txt"
+
+        fs.dircache[parent] = [
+            {"name": src, "type": "file", "size": 1},
+            {"name": dst, "type": "file", "size": 10},
+            {"name": f"{parent}/keep.txt", "type": "file", "size": 20},
+        ]
+
+        response = {"bucket": TEST_HNS_BUCKET, "name": "parent/dst.txt", "size": 1}
+        with mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=True):
+            await fs._mv_file_cache_update(src, dst, response)
+
+        entries = fs.dircache[parent]
+        names = [e["name"] for e in entries]
+        assert src not in names
+        assert names.count(dst) == 1
+        assert any(e["name"] == dst and e["size"] == 1 for e in entries)
+        assert f"{parent}/keep.txt" in names
+
+
+class TestExtendedGcsFileSystemRmFile:
+    """Unit tests for the _rm_file cache update in ExtendedGcsFileSystem."""
+
+    @pytest.mark.asyncio
+    async def test_rm_file_hns_cache_update(self):
+        """For HNS buckets, _rm_file removes only the deleted entry from the
+        immediate parent's listing and leaves ancestor directory caches intact."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        grandparent = f"{TEST_HNS_BUCKET}/grandparent"
+        parent = f"{grandparent}/parent"
+        path = f"{parent}/file1.txt"
+
+        # Pre-populate the cache with the immediate parent and its ancestors.
+        fs.dircache[parent] = [
+            {"name": path, "type": "file"},
+            {"name": f"{parent}/other.txt", "type": "file"},
+        ]
+        fs.dircache[grandparent] = [{"name": parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": grandparent, "type": "directory"}]
+
+        with (
+            mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=True),
+            mock.patch.object(fs, "_call", new_callable=mock.AsyncMock),
+        ):
+            await fs._rm_file(path)
+
+        # The immediate parent's listing is updated, not cleared.
+        assert parent in fs.dircache
+        names = [e["name"] for e in fs.dircache[parent]]
+        assert path not in names
+        assert f"{parent}/other.txt" in names
+
+        # Ancestor directory caches are left intact: HNS directories are
+        # first-class objects, so the redundant invalidation up to the root
+        # is avoided.
+        assert grandparent in fs.dircache
+        assert TEST_HNS_BUCKET in fs.dircache
+
+    @pytest.mark.asyncio
+    async def test_rm_file_cache_update_non_hns_fallback(self):
+        """For non-HNS buckets, _rm_file_cache_update falls back to the base
+        behavior which invalidates the parent and all of its ancestors."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        grandparent = f"{TEST_HNS_BUCKET}/grandparent"
+        parent = f"{grandparent}/parent"
+        path = f"{parent}/file1.txt"
+
+        fs.dircache[parent] = [{"name": path, "type": "file"}]
+        fs.dircache[grandparent] = [{"name": parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": grandparent, "type": "directory"}]
+
+        with mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=False):
+            await fs._rm_file_cache_update(path)
+
+        # The base behavior invalidates the parent and walks up to the root.
+        assert parent not in fs.dircache
+        assert grandparent not in fs.dircache
+        assert TEST_HNS_BUCKET not in fs.dircache
+
+    @pytest.mark.asyncio
+    async def test_rm_files_hns_cache_update(self):
+        """For HNS buckets, batch delete removes only the deleted entries from
+        their immediate parents' listings and leaves ancestor caches intact."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        grandparent = f"{TEST_HNS_BUCKET}/grandparent"
+        parent = f"{grandparent}/parent"
+        path1 = f"{parent}/file1.txt"
+        path2 = f"{parent}/file2.txt"
+
+        fs.dircache[parent] = [
+            {"name": path1, "type": "file"},
+            {"name": path2, "type": "file"},
+            {"name": f"{parent}/keep.txt", "type": "file"},
+        ]
+        fs.dircache[grandparent] = [{"name": parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": grandparent, "type": "directory"}]
+
+        with mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=True):
+            await fs._rm_files_cache_update([path1, path2])
+
+        # The shared parent's listing keeps its surviving entry.
+        assert parent in fs.dircache
+        names = [e["name"] for e in fs.dircache[parent]]
+        assert path1 not in names
+        assert path2 not in names
+        assert f"{parent}/keep.txt" in names
+
+        # Ancestor directory caches are left intact.
+        assert grandparent in fs.dircache
+        assert TEST_HNS_BUCKET in fs.dircache
+
+    @pytest.mark.asyncio
+    async def test_rm_files_cache_update_non_hns_fallback(self):
+        """For non-HNS buckets, the batch cache update falls back to the base
+        behavior which invalidates the parents and all of their ancestors."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        grandparent = f"{TEST_HNS_BUCKET}/grandparent"
+        parent = f"{grandparent}/parent"
+        path = f"{parent}/file1.txt"
+
+        fs.dircache[parent] = [{"name": path, "type": "file"}]
+        fs.dircache[grandparent] = [{"name": parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": grandparent, "type": "directory"}]
+
+        with mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=False):
+            await fs._rm_files_cache_update([path])
+
+        assert parent not in fs.dircache
+        assert grandparent not in fs.dircache
+        assert TEST_HNS_BUCKET not in fs.dircache
+
+    @pytest.mark.asyncio
+    async def test_rm_files_failed_delete_does_not_evict_from_cache(self):
+        """A failed delete in a batch must not be removed from the parent's
+        cached listing: the object still exists in GCS, so the targeted HNS
+        cache update must only see the objects that were actually deleted."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        parent = f"{TEST_HNS_BUCKET}/parent"
+        ok_path = f"{parent}/ok.txt"
+        bad_path = f"{parent}/bad.txt"
+
+        fs.dircache[parent] = [
+            {"name": ok_path, "type": "file"},
+            {"name": bad_path, "type": "file"},
+        ]
+
+        # Batch response: ok.txt is deleted (204), bad.txt fails permanently
+        # (400, which is not retriable).
+        boundary = "==========7330845974216740156=="
+        mock_response_content = (
+            f"\n--{boundary}\n"
+            "Content-Type: application/http\n"
+            "\n"
+            "HTTP/1.1 204 No Content\n"
+            "\n"
+            f"\n--{boundary}\n"
+            "Content-Type: application/http\n"
+            "\n"
+            "HTTP/1.1 400 Bad Request\n"
+            "Content-Type: text/plain\n"
+            "\n"
+            "Error without braces\n"
+            f"--{boundary}--\n"
+        ).encode()
+        mock_headers = {"Content-Type": f"multipart/mixed; boundary={boundary}"}
+
+        with (
+            mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=True),
+            mock.patch.object(fs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        ):
+            mock_call.return_value = (mock_headers, mock_response_content)
+            out = await fs._rm_files([ok_path, bad_path])
+
+        # The failed delete is surfaced to the caller ...
+        assert ok_path in out
+        assert any(isinstance(o, OSError) for o in out)
+
+        # ... and the parent listing keeps the still-present object while
+        # dropping only the one that was actually deleted.
+        assert parent in fs.dircache
+        names = [e["name"] for e in fs.dircache[parent]]
+        assert ok_path not in names
+        assert bad_path in names
+
+
+class TestExtendedGcsFileSystemWriteFileCacheUpdate:
+    """Unit tests for the write-path cache update (_write_file_cache_update),
+    shared by put_file, pipe_file, and cp_file."""
+
+    @pytest.mark.asyncio
+    async def test_write_file_cache_update_cached_parent_pops_only_immediate_parent(
+        self,
+    ):
+        """When the immediate parent is cached (known to exist), creating a file
+        invalidates only that parent's listing; ancestor directory caches are
+        left intact because adding a file cannot create a new directory in an
+        ancestor's listing. This shortcut is bucket-type-agnostic."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        grandparent = f"{TEST_HNS_BUCKET}/gp"
+        parent = f"{grandparent}/p"
+        path = f"{parent}/new.txt"
+
+        fs.dircache[parent] = [{"name": f"{parent}/existing.txt", "type": "file"}]
+        fs.dircache[grandparent] = [{"name": parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": grandparent, "type": "directory"}]
+
+        await fs._write_file_cache_update(path)
+
+        # Only the immediate parent is invalidated.
+        assert parent not in fs.dircache
+        # Ancestors are left intact (no walk to the root).
+        assert grandparent in fs.dircache
+        assert TEST_HNS_BUCKET in fs.dircache
+
+    @pytest.mark.asyncio
+    async def test_cp_file_hns_invalidates_only_immediate_parent(self):
+        """A standard-bucket cp on an HNS bucket invalidates only the
+        destination's immediate parent, leaving the destination's ancestors and
+        the source's parent untouched."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        grandparent = f"{TEST_HNS_BUCKET}/gp"
+        dest_parent = f"{grandparent}/p"
+        dst = f"{dest_parent}/new.txt"
+        src_parent = f"{TEST_HNS_BUCKET}/src"
+        src = f"{src_parent}/old.txt"
+
+        fs.dircache[dest_parent] = [
+            {"name": f"{dest_parent}/existing.txt", "type": "file"}
+        ]
+        fs.dircache[grandparent] = [{"name": dest_parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": grandparent, "type": "directory"}]
+        fs.dircache[src_parent] = [{"name": src, "type": "file"}]
+
+        with (
+            mock.patch.object(fs, "_is_zonal_bucket", return_value=False),
+            mock.patch.object(fs, "_is_bucket_hns_enabled", return_value=True),
+            mock.patch.object(fs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        ):
+            mock_call.return_value = {"done": True}
+            await fs._cp_file(src, dst)
+
+        # Only the destination's immediate parent is invalidated.
+        assert dest_parent not in fs.dircache
+        # Ancestors of the destination and the source's parent are untouched.
+        assert grandparent in fs.dircache
+        assert TEST_HNS_BUCKET in fs.dircache
+        assert src_parent in fs.dircache
+
+    @pytest.mark.asyncio
+    async def test_write_file_cache_update_uncached_parent_falls_back_to_broad(
+        self,
+    ):
+        """When the immediate parent is not cached, the write may have created
+        it (flat buckets simulate directories from object prefixes; HNS
+        auto-creates missing parent folders on object write), so a cached
+        ancestor must be invalidated rather than left to hide the new directory.
+        The single-level shortcut only applies to an already-cached (known to
+        exist) parent."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        grandparent = f"{TEST_HNS_BUCKET}/gp"
+        parent = f"{grandparent}/p"
+        path = f"{parent}/new.txt"
+
+        # The immediate parent is NOT cached; an ancestor IS cached.
+        fs.dircache[grandparent] = [{"name": parent, "type": "directory"}]
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": grandparent, "type": "directory"}]
+
+        await fs._write_file_cache_update(path)
+
+        # Broad invalidation: cached ancestors are popped so a re-list picks up
+        # any directory the write implicitly created.
+        assert grandparent not in fs.dircache
+        assert TEST_HNS_BUCKET not in fs.dircache
+
+
+class TestExtendedGcsFileSystemCacheHelpers:
+    """Unit tests for the shared low-level dircache primitives."""
+
+    def test_cache_drop_entries_removes_named_entries(self):
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        parent = f"{TEST_HNS_BUCKET}/p"
+        fs.dircache[parent] = [
+            {"name": f"{parent}/a", "type": "file"},
+            {"name": f"{parent}/b", "type": "file"},
+            {"name": f"{parent}/c", "type": "file"},
+        ]
+
+        fs._cache_drop_entries(parent, {f"{parent}/a", f"{parent}/c"})
+
+        assert [e["name"] for e in fs.dircache[parent]] == [f"{parent}/b"]
+
+    def test_cache_drop_entries_noop_when_parent_uncached(self):
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        parent = f"{TEST_HNS_BUCKET}/p"
+
+        # Must not raise and must not materialize the missing key.
+        fs._cache_drop_entries(parent, {f"{parent}/a"})
+
+        assert parent not in fs.dircache
+
+    def test_cache_add_entry_appends_to_parent(self):
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        parent = f"{TEST_HNS_BUCKET}/p"
+        fs.dircache[parent] = [{"name": f"{parent}/a", "type": "file"}]
+        entry = {"name": f"{parent}/b", "type": "file"}
+
+        fs._cache_add_entry(parent, entry)
+
+        assert entry in fs.dircache[parent]
+
+    def test_cache_add_entry_noop_when_parent_uncached(self):
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        parent = f"{TEST_HNS_BUCKET}/p"
+
+        fs._cache_add_entry(parent, {"name": f"{parent}/b", "type": "file"})
+
+        assert parent not in fs.dircache
+
+    def test_update_dircache_after_rename_clears_destination_descendants(self):
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        src = f"{TEST_HNS_BUCKET}/src"
+        dst = f"{TEST_HNS_BUCKET}/dst"
+        dst_child = f"{dst}/child"
+
+        fs.dircache[TEST_HNS_BUCKET] = [
+            {"name": src, "type": "directory"},
+            {"name": dst, "type": "directory"},
+        ]
+        fs.dircache[src] = [{"name": f"{src}/new.txt", "type": "file"}]
+        fs.dircache[f"{src}/nested"] = [
+            {"name": f"{src}/nested/new.txt", "type": "file"}
+        ]
+        fs.dircache[dst] = [{"name": f"{dst}/old.txt", "type": "file"}]
+        fs.dircache[dst_child] = [{"name": f"{dst_child}/old.txt", "type": "file"}]
+
+        fs._update_dircache_after_rename(src, dst)
+
+        assert src not in fs.dircache
+        assert f"{src}/nested" not in fs.dircache
+        assert dst not in fs.dircache
+        assert dst_child not in fs.dircache
+        assert [e["name"] for e in fs.dircache[TEST_HNS_BUCKET]] == [dst]
+
+    def test_update_dircache_after_rename_strips_protocol(self):
+        """Protocol-qualified paths (``gs://...``) must mutate the same cache
+        keys/entries as stripped paths, since the dircache stores names without
+        the protocol. Without stripping, the pop/startswith matching no-ops."""
+        fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+        src = f"{TEST_HNS_BUCKET}/src"
+        dst = f"{TEST_HNS_BUCKET}/dst"
+
+        fs.dircache[TEST_HNS_BUCKET] = [{"name": src, "type": "directory"}]
+        fs.dircache[src] = [{"name": f"{src}/new.txt", "type": "file"}]
+        fs.dircache[f"{src}/nested"] = [
+            {"name": f"{src}/nested/new.txt", "type": "file"}
+        ]
+
+        # Callers such as _mv pass the raw (protocol-qualified) paths through.
+        fs._update_dircache_after_rename(f"gs://{src}", f"gs://{dst}")
+
+        # Source and its descendants are dropped from the cache.
+        assert src not in fs.dircache
+        assert f"{src}/nested" not in fs.dircache
+        # The source entry is removed from, and the stripped destination entry
+        # added to, the parent listing.
+        names = [e["name"] for e in fs.dircache[TEST_HNS_BUCKET]]
+        assert names == [dst]
+
 
 class TestExtendedGcsFileSystemMkdir:
     """Tests for the mkdir method in ExtendedGcsFileSystem."""
@@ -691,14 +1105,9 @@ class TestExtendedGcsFileSystemMkdir:
         dir_path = f"{TEST_HNS_BUCKET}/new_mkdir_dir"
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
-            mocks["info"].side_effect = [
-                FileNotFoundError,  # exists check before mkdir
-                {"type": "directory", "name": dir_path},  # exists check after
-            ]
+            mocks["info"].side_effect = FileNotFoundError
 
-            assert not gcsfs.exists(dir_path)
             gcsfs.mkdir(dir_path)
-            assert gcsfs.exists(dir_path)
 
             mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
             expected_request = self._get_create_folder_request(dir_path)
@@ -714,16 +1123,15 @@ class TestExtendedGcsFileSystemMkdir:
         dir_path = f"{parent_dir}/new_nested_dir"
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
-            mocks["info"].side_effect = [
-                FileNotFoundError,  # exists check before mkdir
-                {"type": "directory", "name": parent_dir},  # parent exists check
-                {"type": "directory", "name": dir_path},  # exists check after
-            ]
 
-            assert not gcsfs.exists(dir_path)
+            def mock_info(path, *args, **kwargs):
+                if path == parent_dir:
+                    return {"type": "directory", "name": parent_dir}
+                raise FileNotFoundError
+
+            mocks["info"].side_effect = mock_info
+
             gcsfs.mkdir(dir_path, create_parents=True)
-            assert gcsfs.exists(parent_dir)
-            assert gcsfs.exists(dir_path)
 
             mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
             expected_request = self._get_create_folder_request(dir_path, recursive=True)
@@ -740,6 +1148,7 @@ class TestExtendedGcsFileSystemMkdir:
         dir_path = f"{TEST_HNS_BUCKET}/non_existent_parent/new_dir"
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].side_effect = FileNotFoundError
             mocks["control_client"].create_folder.side_effect = (
                 api_exceptions.FailedPrecondition("failed due to a precondition error")
             )
@@ -799,16 +1208,10 @@ class TestExtendedGcsFileSystemMkdir:
         dir_path = f"{bucket_name}/some_dir"
 
         with gcs_hns_mocks(BucketType.UNKNOWN, gcsfs) as mocks:
-            # Simulate the bucket not existing initially, then existing after creation.
-            mocks["info"].side_effect = [
-                FileNotFoundError,  # For the `exists` check on the bucket
-                {"type": "directory", "name": bucket_name},  # For `exists` after
-            ]
+            # Simulate the bucket not existing initially.
+            mocks["info"].side_effect = FileNotFoundError
 
-            assert not gcsfs.exists(bucket_name)
-            # This should create the bucket `bucket_name` and then do nothing for `some_dir`
             gcsfs.mkdir(dir_path, create_parents=True)
-            assert gcsfs.exists(bucket_name)
 
             mocks["async_lookup_bucket_type"].assert_called_once_with(bucket_name)
             # The call should fall back to the parent's mkdir to create the bucket.
@@ -824,21 +1227,13 @@ class TestExtendedGcsFileSystemMkdir:
         dir_path = f"{bucket_name}/some_dir"
 
         with gcs_hns_mocks(BucketType.UNKNOWN, gcsfs) as mocks:
-            # Simulate the bucket not existing initially, then existing after creation.
-            mocks["info"].side_effect = [
-                FileNotFoundError,  # For the exists check on the bucket before mkdir call
-                FileNotFoundError,  # For bucket exists check in mkdir method
-                {"type": "directory", "name": bucket_name},  # For exists on bucket
-                {"type": "directory", "name": dir_path},  # For exists on directory
-            ]
+            # All paths do not exist initially
+            mocks["info"].side_effect = FileNotFoundError
 
-            assert not gcsfs.exists(bucket_name)
-            # This should create the HNS bucket `bucket_name` and then do nothing for `some_dir`
+            # This should create the HNS bucket `bucket_name` and then create `some_dir`
             gcsfs.mkdir(
                 dir_path, create_parents=True, enable_hierarchical_namespace=True
             )
-            assert gcsfs.exists(bucket_name)
-            assert gcsfs.exists(dir_path)
 
             # The call should fall back to the parent's mkdir to create the bucket.
             mocks["super_mkdir"].assert_called_once_with(
@@ -937,20 +1332,28 @@ class TestExtendedGcsFileSystemMkdir:
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
             mocks["info"].return_value = {"type": "directory", "name": dir_path}
-            mocks["control_client"].create_folder.side_effect = api_exceptions.Conflict(
-                "Folder already exists"
-            )
 
             assert gcsfs.exists(dir_path)
             gcsfs.mkdir(dir_path)
             assert gcsfs.exists(dir_path)
 
-            expected_request = self._get_create_folder_request(dir_path)
-            mocks["control_client"].create_folder.assert_called_once_with(
-                request=expected_request, retry=mock.ANY, timeout=mock.ANY
-            )
+            mocks["control_client"].create_folder.assert_not_called()
             mocks["super_mkdir"].assert_not_called()
             mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
+
+    def test_mkdir_existing_file_raises_error(self, gcs_hns, gcs_hns_mocks):
+        """Test that calling mkdir on a path occupied by an existing file raises FileExistsError."""
+        gcsfs = gcs_hns
+        file_path = f"{TEST_HNS_BUCKET}/existing_file"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "file", "name": file_path}
+
+            with pytest.raises(FileExistsError, match="A file already exists"):
+                gcsfs.mkdir(file_path)
+
+            mocks["control_client"].create_folder.assert_not_called()
+            mocks["super_mkdir"].assert_not_called()
 
     def test_mkdir_with_placement_string(self, gcs_hns, gcs_hns_mocks):
         """Test mkdir with placement as a string (Zonal bucket)."""
@@ -1007,6 +1410,179 @@ class TestExtendedGcsFileSystemMkdir:
             mocks["control_client"].create_folder.assert_called_once_with(
                 request=expected_request, retry=mock.ANY, timeout=mock.ANY
             )
+
+
+class TestExtendedGcsFileSystemMakedirs:
+    """Tests for the makedirs method in ExtendedGcsFileSystem."""
+
+    def _get_create_folder_request(self, dir_path, recursive=True):
+        """Constructs a CreateFolderRequest for testing."""
+        bucket, folder_path = dir_path.split("/", 1)
+        return storage_control_v2.CreateFolderRequest(
+            parent=f"projects/_/buckets/{bucket}",
+            folder_id=folder_path.rstrip("/") + "/",
+            recursive=recursive,
+            request_id=FIXED_REQUEST_ID,
+        )
+
+    def test_hns_makedirs_success(self, gcs_hns, gcs_hns_mocks):
+        """Test successful HNS folder creation via makedirs."""
+        gcsfs = gcs_hns
+        dir_path = f"{TEST_HNS_BUCKET}/new_dir/nested_dir"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            folder_exists = False
+
+            def mock_info(path, *args, **kwargs):
+                if path == TEST_HNS_BUCKET:
+                    return {"type": "directory", "name": TEST_HNS_BUCKET}
+                if path == dir_path:
+                    if folder_exists:
+                        return {"type": "directory", "name": dir_path}
+                    raise FileNotFoundError
+                raise FileNotFoundError
+
+            mocks["info"].side_effect = mock_info
+
+            assert not gcsfs.exists(dir_path)
+            gcsfs.makedirs(dir_path)
+            folder_exists = True
+            assert gcsfs.exists(dir_path)
+
+            mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
+            expected_request = self._get_create_folder_request(dir_path, recursive=True)
+            mocks["control_client"].create_folder.assert_called_once_with(
+                request=expected_request, retry=mock.ANY, timeout=mock.ANY
+            )
+            mocks["super_makedirs"].assert_not_called()
+
+    def test_hns_makedirs_existing_dir_exist_ok_true(self, gcs_hns, gcs_hns_mocks):
+        """Test makedirs when folder already exists and exist_ok=True (no-op)."""
+        gcsfs = gcs_hns
+        dir_path = f"{TEST_HNS_BUCKET}/existing_dir"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+
+            def mock_info(path, *args, **kwargs):
+                if path == TEST_HNS_BUCKET:
+                    return {"type": "directory", "name": TEST_HNS_BUCKET}
+                if path == dir_path:
+                    return {"type": "directory", "name": dir_path}
+                raise FileNotFoundError
+
+            mocks["info"].side_effect = mock_info
+
+            gcsfs.makedirs(dir_path, exist_ok=True)
+
+            mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
+            mocks["control_client"].create_folder.assert_not_called()
+            mocks["super_makedirs"].assert_not_called()
+
+    def test_hns_makedirs_existing_dir_exist_ok_false(self, gcs_hns, gcs_hns_mocks):
+        """Test makedirs raises FileExistsError if folder exists and exist_ok=False."""
+        gcsfs = gcs_hns
+        dir_path = f"{TEST_HNS_BUCKET}/existing_dir"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+
+            def mock_info(path, *args, **kwargs):
+                if path == TEST_HNS_BUCKET:
+                    return {"type": "directory", "name": TEST_HNS_BUCKET}
+                if path == dir_path:
+                    return {"type": "directory", "name": dir_path}
+                raise FileNotFoundError
+
+            mocks["info"].side_effect = mock_info
+
+            with pytest.raises(FileExistsError, match="Directory already exists"):
+                gcsfs.makedirs(dir_path, exist_ok=False)
+
+            mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
+            mocks["control_client"].create_folder.assert_not_called()
+            mocks["super_makedirs"].assert_not_called()
+
+    def test_hns_makedirs_existing_file_error(self, gcs_hns, gcs_hns_mocks):
+        """Test makedirs raises FileExistsError if a file exists at the path (regardless of exist_ok)."""
+        gcsfs = gcs_hns
+        file_path = f"{TEST_HNS_BUCKET}/existing_file"
+
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+
+            def mock_info(path, *args, **kwargs):
+                if path == TEST_HNS_BUCKET:
+                    return {"type": "directory", "name": TEST_HNS_BUCKET}
+                if path == file_path:
+                    return {"type": "file", "name": file_path}
+                raise FileNotFoundError
+
+            mocks["info"].side_effect = mock_info
+
+            with pytest.raises(FileExistsError, match="A file already exists"):
+                gcsfs.makedirs(file_path, exist_ok=True)
+
+            with pytest.raises(FileExistsError, match="A file already exists"):
+                gcsfs.makedirs(file_path, exist_ok=False)
+
+            mocks["control_client"].create_folder.assert_not_called()
+            mocks["super_makedirs"].assert_not_called()
+
+    def test_makedirs_non_hns_bucket_is_noop(self, gcs_hns, gcs_hns_mocks):
+        """Test that makedirs is a no-op for non-HNS buckets and does not fall back to super_makedirs."""
+        gcsfs = gcs_hns
+        dir_path = f"{TEST_HNS_BUCKET}/some_dir/nested"
+
+        with gcs_hns_mocks(BucketType.NON_HIERARCHICAL, gcsfs) as mocks:
+
+            def mock_info(path, *args, **kwargs):
+                if path == TEST_HNS_BUCKET:
+                    return {"type": "directory", "name": TEST_HNS_BUCKET}
+                raise FileNotFoundError
+
+            mocks["info"].side_effect = mock_info
+
+            gcsfs.makedirs(dir_path)
+            mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
+            mocks["control_client"].create_folder.assert_not_called()
+            mocks["super_makedirs"].assert_not_called()
+
+    def test_makedirs_non_existent_bucket_raises_error(self, gcs_hns, gcs_hns_mocks):
+        """Test that makedirs on a folder path in a non-existent bucket raises FileNotFoundError."""
+        gcsfs = gcs_hns
+        bucket_name = f"gcsfs-non-existent-bucket-{uuid.uuid4()}"
+        dir_path = f"{bucket_name}/some_dir/nested"
+
+        with gcs_hns_mocks(BucketType.UNKNOWN, gcsfs) as mocks:
+            mocks["info"].side_effect = FileNotFoundError
+
+            with pytest.raises(FileNotFoundError, match="Bucket does not exist"):
+                gcsfs.makedirs(dir_path)
+
+            mocks["control_client"].create_folder.assert_not_called()
+            mocks["super_makedirs"].assert_not_called()
+
+    @pytest.mark.parametrize("exist_ok", [True, False])
+    def test_makedirs_bucket_only_checks_existence(
+        self, gcs_hns, gcs_hns_mocks, exist_ok
+    ):
+        """Test makedirs on bucket path raises FileNotFoundError if bucket
+        doesn't exist, and FileExistsError if exists and not exist_ok."""
+        gcsfs = gcs_hns
+        bucket_path = f"new-bucket-{uuid.uuid4()}"
+
+        # Case 1: Bucket does not exist
+        with gcs_hns_mocks(BucketType.UNKNOWN, gcsfs) as mocks:
+            mocks["info"].side_effect = FileNotFoundError
+            with pytest.raises(FileNotFoundError, match="Bucket does not exist"):
+                gcsfs.makedirs(bucket_path, exist_ok=exist_ok)
+
+        # Case 2: Bucket exists
+        with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].return_value = {"type": "directory", "name": bucket_path}
+            if not exist_ok:
+                with pytest.raises(FileExistsError, match="Bucket already exists"):
+                    gcsfs.makedirs(bucket_path, exist_ok=False)
+            else:
+                gcsfs.makedirs(bucket_path, exist_ok=True)
 
 
 class TestExtendedGcsFileSystemFind:
@@ -1904,7 +2480,10 @@ class TestExtendedGcsFileSystemRmdir:
             gcsfs.rmdir(folder_path)
 
             assert not gcsfs.exists(folder_path)
-            mocks["async_lookup_bucket_type"].assert_called_once_with(TEST_HNS_BUCKET)
+            # The bucket type is looked up both for the rmdir itself and for the
+            # targeted cache update when the placeholder object is deleted via
+            # _rm_file. The lookup is cached, so this is not an extra API call.
+            mocks["async_lookup_bucket_type"].assert_any_call(TEST_HNS_BUCKET)
             expected_request = self._get_delete_folder_request(folder_path)
             mocks["control_client"].delete_folder.assert_called_once_with(
                 request=expected_request, retry=mock.ANY, timeout=mock.ANY
@@ -2448,6 +3027,7 @@ class TestStorageControlRetryExecution:
         path = f"{TEST_HNS_BUCKET}/test_retry_config"
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].side_effect = FileNotFoundError
             mock_create = mocks["control_client"].create_folder
             mock_create.return_value = mock.AsyncMock()
 
@@ -2473,6 +3053,7 @@ class TestStorageControlRetryExecution:
         path = f"{TEST_HNS_BUCKET}/test_per_attempt_timeout"
 
         with gcs_hns_mocks(BucketType.HIERARCHICAL, gcsfs) as mocks:
+            mocks["info"].side_effect = FileNotFoundError
             mock_create = mocks["control_client"].create_folder
             mock_create.return_value = mock.AsyncMock()
 

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from glob import has_magic
 
+import aiohttp
 import fsspec
 from fsspec import asyn
 from fsspec.callbacks import NoOpCallback
@@ -26,7 +27,9 @@ from google.cloud.storage.asyncio.async_multi_range_downloader import (
 
 from gcsfs import __version__ as version
 from gcsfs import zb_hns_utils
-from gcsfs.core import GCSFile, GCSFileSystem
+from gcsfs._dircache import HnsDirCacheUpdater
+from gcsfs.concurrency import split_range
+from gcsfs.core import GCSFile, GCSFileSystem, _get_prefetcher_and_cache_config
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -77,7 +80,7 @@ async def _get_mrd_size(mrd_or_pool):
         return m.persisted_size
 
 
-class ExtendedGcsFileSystem(GCSFileSystem):
+class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     """
     This class will be used when GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT env variable is set to true.
     ExtendedGcsFileSystem is a subclass of GCSFileSystem that adds new logic for bucket types
@@ -148,6 +151,13 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             self.loop,
             self._mrd_pool_cache,
         )
+
+    async def _get_threshold_for_disk_reads(self, bucket):
+        if await self._is_zonal_bucket(bucket):
+            return (
+                5 * 1024 * 1024
+            )  # Thanks to our in house, zero copy DirectMemmoveBuffer
+        return await super()._get_threshold_for_disk_reads(bucket)
 
     @staticmethod
     def _finalize_mrd_pool_cache(loop, cache):
@@ -401,6 +411,18 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         bucket_type = await self._lookup_bucket_type(bucket)
         return bucket_type == BucketType.ZONAL_HIERARCHICAL
 
+    @staticmethod
+    def _resolve_cache_config(kwargs):
+        """Resolves cache_type and cache_source from kwargs if not already provided."""
+        kwargs = kwargs or {}
+        cache_type = kwargs.get("cache_type")
+        cache_source = kwargs.get("cache_source")
+        if not cache_type or not cache_source:
+            cache_type, _, cache_source = _get_prefetcher_and_cache_config(
+                cache_type, kwargs
+            )
+        return cache_type, cache_source
+
     async def _fetch_range_split(
         self,
         path,
@@ -431,11 +453,19 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         pool_created_here = False
         bucket, object_name, generation = self.split_path(path)
 
+        # Only resolve if the config wasn't already passed down (e.g., from ZonalFile)
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
         if mrd is None:
             # If no mrd is provided, we create one with pool size equal to passed concurrency.
             pool_size = min(len(chunk_lengths), concurrency)
             mrd = await self._mrd_pool_cache.get(
-                bucket, object_name, generation, pool_size=pool_size
+                bucket,
+                object_name,
+                generation,
+                pool_size=pool_size,
+                cache_type=cache_type,
+                cache_source=cache_source,
             )
             pool_created_here = True
 
@@ -444,6 +474,8 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             current_offset = start_offset
 
             cat_kwargs = kwargs.copy()
+            cat_kwargs["cache_type"] = cache_type
+            cat_kwargs["cache_source"] = cache_source
 
             for length in chunk_lengths:
                 end_offset = current_offset + length
@@ -487,10 +519,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
     async def _concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool):
         """Helper to handle concurrent chunk downloads cleanly."""
-        concurrency = (
-            concurrency if length >= self.MIN_CHUNK_SIZE_FOR_CONCURRENCY else 1
-        )
-        part_size = length // concurrency
+        ranges = split_range(length, concurrency, self.MIN_CHUNK_SIZE_FOR_CONCURRENCY)
 
         tasks = []
         views = []
@@ -508,9 +537,8 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                     )
                 await m_client.download_ranges([(o, s, view)])
 
-        for i in range(concurrency):
-            part_offset = offset + (i * part_size)
-            actual_size = part_size if i < concurrency - 1 else length - (i * part_size)
+        for relative_offset, actual_size in ranges:
+            part_offset = offset + relative_offset
 
             # Give each task a restricted view of the master buffer
             view = master_buffer.get_view(part_offset - offset, actual_size)
@@ -578,6 +606,9 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
         # A new MRDPool is required when read is done directly by the
         # GCSFilesystem class without creating a GCSFile object first.
+        # Only resolve if the config wasn't already passed down (e.g., from ZonalFile)
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
         if mrd is None:
             bucket, object_name, generation = self.split_path(path)
             if not await self._is_zonal_bucket(bucket):
@@ -588,7 +619,12 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
             # Instantiate an MRDPool locally for this call
             mrd = await self._mrd_pool_cache.get(
-                bucket, object_name, generation, pool_size=concurrency
+                bucket,
+                object_name,
+                generation,
+                pool_size=concurrency,
+                cache_type=cache_type,
+                cache_source=cache_source,
             )
             pool_created_here = True
 
@@ -612,7 +648,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             return await self._concurrent_mrd_fetch(
                 offset,
                 length,
-                concurrency if length >= self.MIN_CHUNK_SIZE_FOR_CONCURRENCY else 1,
+                concurrency,
                 mrd,
             )
 
@@ -633,81 +669,6 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             return False
 
         return bucket_type in [BucketType.ZONAL_HIERARCHICAL, BucketType.HIERARCHICAL]
-
-    def _update_dircache_after_rename(self, path1, path2):
-        """
-        Performs a targeted update of the directory cache after a successful
-        folder rename operation.
-
-        This involves three main steps:
-        1. Removing the source folder and all its descendants from the cache.
-        2. Removing the source folder's entry from its parent's listing.
-        3. Adding the new destination folder's entry to its parent's listing.
-
-        Args:
-            path1 (str): The source path that was renamed.
-            path2 (str): The destination path.
-        """
-        # 1. Find and remove all descendant paths of the source from the cache.
-        source_prefix = f"{path1.rstrip('/')}/"
-        for key in list(self.dircache):
-            if key.startswith(source_prefix):
-                self.dircache.pop(key, None)
-
-        # 2. Remove the old source entry from its parent's listing.
-        self.dircache.pop(path1, None)
-        parent1 = self._parent(path1)
-        if parent1 in self.dircache:
-            self.dircache[parent1] = [
-                e for e in self.dircache[parent1] if e.get("name") != path1
-            ]
-
-        # 3. Invalidate the destination path and update its parent's cache.
-        self.dircache.pop(path2, None)
-        parent2 = self._parent(path2)
-        if parent2 in self.dircache:
-            _, key2, _ = self.split_path(path2)
-            new_entry = {
-                "Key": key2,
-                "Size": 0,
-                "name": path2,
-                "size": 0,
-                "type": "directory",
-                "storageClass": "DIRECTORY",
-            }
-            self.dircache[parent2].append(new_entry)
-
-    async def _mv_file_cache_update(self, path1, path2, response=None):
-        """
-        Update the cache after a file move operation.
-
-        For HNS-enabled buckets where the move is within the same bucket, this method
-        directly updates the directory cache by removing the source entry from it's
-        parent cache and adding destination path as a new entry in it's corresponding parent cache.
-        This avoids invalidating the entire parent directory cache, which is beneficial for HNS
-        performance.
-
-        For non-HNS buckets or cross-bucket moves, it falls back to the default
-        behavior (invalidating the cache for both source and destination parents).
-        """
-        src_bucket, _, _ = self.split_path(path1)
-        dest_bucket, _, _ = self.split_path(path2)
-
-        if await self._is_bucket_hns_enabled(src_bucket) and src_bucket == dest_bucket:
-            src_parent = self._parent(path1)
-            if src_parent in self.dircache:
-                path1_stripped = self._strip_protocol(path1)
-                self.dircache[src_parent] = [
-                    e
-                    for e in self.dircache[src_parent]
-                    if e.get("name") != path1_stripped
-                ]
-            dest_parent = self._parent(path2)
-            if dest_parent in self.dircache and response:
-                new_entry = self._process_object(dest_bucket, response)
-                self.dircache[dest_parent].append(new_entry)
-        else:
-            await super()._mv_file_cache_update(path1, path2, response)
 
     async def _mv(self, path1, path2, **kwargs):
         """
@@ -918,8 +879,28 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             path, create_parents=create_parents, **bucket_kwargs
         )
 
-    async def _create_hns_folder(self, path, bucket, key, create_parents):
+    async def _create_hns_folder(
+        self, path, bucket, key, create_parents, exist_ok=True
+    ):
         logger.debug(f"Using HNS-aware mkdir for '{path}'.")
+
+        # Preemptively check if the path already exists to ensure fsspec compatibility.
+        # This check is required because GCS natively allows a file and a folder
+        # with the exact same name to co-exist at the same level. Consequently, the GCS
+        # server's create_folder API will succeed silently and not raise a Conflict
+        # if a file already exists at the target path. To enforce standard POSIX/fsspec
+        # filesystem semantics (forbidding file/directory name collisions), we need to
+        # explicitly verify client-side that no file occupies the target path.
+        try:
+            info = await self._info(path)
+            if info["type"] != "directory":
+                raise FileExistsError(f"A file already exists at the path: {path}")
+            if not exist_ok:
+                raise FileExistsError(f"Directory already exists: {path}")
+            return
+        except FileNotFoundError:
+            pass
+
         parent = f"projects/_/buckets/{bucket}"
         folder_id = key.rstrip("/") + "/"
         request = storage_control_v2.CreateFolderRequest(
@@ -937,19 +918,15 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                 timeout=STORAGE_CONTROL_RPC_TIMEOUT,
             )
             # Instead of invalidating the parent cache, update it to add the new entry.
-            parent_path = self._parent(path)
-            if parent_path in self.dircache:
-                new_entry = {
-                    "Key": key.rstrip("/"),
-                    "Size": 0,
-                    "name": path,
-                    "size": 0,
-                    "type": "directory",
-                    "storageClass": "DIRECTORY",
-                }
-                self.dircache[parent_path].append(new_entry)
+            self._cache_add_entry(
+                self._parent(path),
+                self._directory_cache_entry(path, key.rstrip("/")),
+            )
         except api_exceptions.Conflict as e:
-            logger.debug(f"Directory already exists: {path}: {e}")
+            logger.debug(f"Conflict detected for path: {path}: {e}")
+            # Under race conditions, folder might have been created concurrently
+            if not exist_ok:
+                raise FileExistsError(f"Directory already exists: {path}") from e
         except api_exceptions.FailedPrecondition as e:
             # This error can occur if create_parents=False and the parent dir doesn't exist.
             # Translate it to FileNotFoundError for fsspec compatibility.
@@ -958,6 +935,59 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             ) from e
 
     mkdir = asyn.sync_wrapper(_mkdir)
+
+    async def _makedirs(self, path, exist_ok=False):
+        """Recursively make directories.
+
+        For HNS-enabled buckets, this natively creates the folder objects recursively.
+        For standard GCS buckets, since folders are simulated, this is a no-op.
+
+        Parameters
+        ----------
+        path : str
+            Leaf directory name.
+        exist_ok : bool (False)
+            If False, will error if the target directory already exists.
+            If True, will succeed silently if it exists as a directory, but
+            will still error if it exists as a file.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the target bucket does not exist.
+        FileExistsError
+            If `exist_ok` is False and the directory already exists, or if a
+            file already exists at the target path regardless of `exist_ok`.
+        """
+        path = self._strip_protocol(path)
+        bucket, key, _ = self.split_path(path)
+
+        if bucket in ["", "/"]:
+            raise ValueError("Cannot create root bucket")
+
+        # First, check if the bucket exists
+        if not await self._exists(bucket):
+            raise FileNotFoundError(f"Bucket does not exist: {bucket}")
+
+        if not key:
+            # Bucket-only case: makedirs is not for bucket creation.
+            # Since the bucket exists, raise FileExistsError if not exist_ok.
+            if not exist_ok:
+                raise FileExistsError(f"Bucket already exists: {bucket}")
+            return
+
+        # Check if the bucket is HNS-enabled
+        is_hns = await self._is_bucket_hns_enabled(bucket)
+        if not is_hns:
+            # For non-HNS buckets, directory creation is a no-op
+            return
+
+        # Recursively create the native folders in the HNS bucket
+        await self._create_hns_folder(
+            path, bucket, key, create_parents=True, exist_ok=exist_ok
+        )
+
+    makedirs = asyn.sync_wrapper(_makedirs)
 
     async def _get_directory_info(self, path, bucket, key, generation):
         """
@@ -1066,12 +1096,8 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
             # Remove the directory from the cache and from its parent's listing.
             self.dircache.pop(path, None)
-            parent = self._parent(path)
-            if parent in self.dircache:
-                # Remove the deleted directory entry from the parent's listing.
-                self.dircache[parent] = [
-                    e for e in self.dircache[parent] if e.get("name") != path
-                ]
+            # Remove the deleted directory entry from the parent's listing.
+            self._cache_drop_entries(self._parent(path), {path})
             return
         except api_exceptions.NotFound as e:
             # This can happen if the directory does not exist, or if the path
@@ -1587,7 +1613,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             finalize_on_close = kwargs.get("finalize_on_close", self.finalize_on_close)
             await zb_hns_utils.close_aaow(writer, finalize_on_close=finalize_on_close)
 
-        self.invalidate_cache(self._parent(rpath))
+        await self._write_file_cache_update(rpath)
 
     async def _pipe_file(
         self,
@@ -1653,15 +1679,18 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         # Works for both 'overwrite' and 'create' modes
         writer = await zb_hns_utils.init_aaow(self.grpc_client, bucket, key)
         try:
-            for i in range(0, len(data), chunksize):
-                await writer.append(data[i : i + chunksize])
+            with memoryview(data) as data_view:
+                for i in range(0, len(data_view), chunksize):
+                    await writer.append(data_view[i : i + chunksize])
         finally:
             finalize_on_close = kwargs.get("finalize_on_close", self.finalize_on_close)
             await zb_hns_utils.close_aaow(writer, finalize_on_close=finalize_on_close)
 
-        self.invalidate_cache(self._parent(path))
+        await self._write_file_cache_update(path)
 
-    async def _get_file(self, rpath, lpath, callback=None, **kwargs):
+    async def _get_file_request(
+        self, rpath, lpath, *args, headers=None, callback=None, **kwargs
+    ):
         """
         Downloads a file from GCS to a local path.
 
@@ -1680,20 +1709,30 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             For Zonal buckets, `chunksize` bytes (int) can be provided to control
             the download chunk size (default is 128KB).
         """
-        bucket, key, generation = self.split_path(rpath)
+        bucket, key, path_generation = self.split_path(rpath)
+
         if not await self._is_zonal_bucket(bucket):
-            return await super()._get_file(
-                rpath,
-                lpath,
-                callback=callback,
-                **kwargs,
+            return await super()._get_file_request(
+                rpath, lpath, *args, headers=headers, callback=callback, **kwargs
             )
 
         if os.path.isdir(lpath):
             return
+
+        # Coalesce generation: URL parsed vs kwargs
+        generation = path_generation or kwargs.get("generation")
         callback = callback or NoOpCallback()
 
-        mrd_pool = await self._mrd_pool_cache.get(bucket, key, generation, pool_size=1)
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
+        mrd_pool = await self._mrd_pool_cache.get(
+            bucket,
+            key,
+            generation,
+            pool_size=1,
+            cache_type=cache_type,
+            cache_source=cache_source,
+        )
         try:
             async with mrd_pool.get_mrd() as mrd:
                 size = mrd.persisted_size
@@ -1703,7 +1742,8 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                         "Falling back to _info() to get the file size. "
                         "This may result in incorrect behavior for unfinalized objects."
                     )
-                    size = (await self._info(rpath))["size"]
+                    size = (await self._info(rpath, **kwargs)).get("size", 0)
+
                 callback.set_size(size)
 
                 lparent = os.path.dirname(lpath) or os.curdir
@@ -1726,12 +1766,87 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                         f2.write(data)
                         offset += len(data)
                         callback.relative_update(len(data))
+
+                if offset != size:
+                    raise aiohttp.ClientError(
+                        f"Expected {size} bytes, but only received {offset} bytes"
+                    )
         except Exception as e:
             # Clean up the corrupted file before raising error
             if os.path.exists(lpath):
                 os.remove(lpath)
             raise e
         finally:
+            await mrd_pool.close()
+
+    async def _get_file_concurrent(
+        self,
+        rpath,
+        lpath,
+        concurrency,
+        chunk_size,
+        max_prefetch_size,
+        headers=None,
+        callback=None,
+        fetcher_fn=None,
+        **kwargs,
+    ):
+        bucket, key, path_generation = self.split_path(rpath)
+
+        # Delegate standard buckets to the original implementation
+        if not await self._is_zonal_bucket(bucket):
+            return await super()._get_file_concurrent(
+                rpath,
+                lpath,
+                concurrency,
+                chunk_size,
+                max_prefetch_size,
+                headers=headers,
+                callback=callback,
+                fetcher_fn=fetcher_fn,
+                **kwargs,
+            )
+
+        generation = path_generation or kwargs.get("generation")
+
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
+        # Initialize the MRDPool once for this concurrent operation
+        mrd_pool = await self._mrd_pool_cache.get(
+            bucket,
+            key,
+            generation,
+            pool_size=concurrency,
+            cache_type=cache_type,
+            cache_source=cache_source,
+        )
+
+        # Define a custom fetcher that passes the pool to _cat_file
+        async def custom_fetcher(start, size, split_factor=1):
+            return await self._cat_file(
+                rpath,
+                start=start,
+                end=start + size,
+                mrd=mrd_pool,  # Inject the shared pool here
+                concurrency=split_factor,
+                headers=headers,
+                **kwargs,
+            )
+
+        try:
+            return await super()._get_file_concurrent(
+                rpath,
+                lpath,
+                concurrency,
+                chunk_size,
+                max_prefetch_size,
+                headers=headers,
+                callback=callback,
+                fetcher_fn=custom_fetcher,  # Pass our custom fetcher up the chain
+                **kwargs,
+            )
+        finally:
+            # Ensure the pool is closed when the download completes or fails
             await mrd_pool.close()
 
     async def _do_list_objects(

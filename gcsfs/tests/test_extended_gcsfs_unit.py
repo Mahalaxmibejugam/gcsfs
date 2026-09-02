@@ -4,6 +4,7 @@ import io
 import logging
 from unittest import mock
 
+import aiohttp
 import pytest
 from google.cloud.storage.asyncio.async_multi_range_downloader import (
     AsyncMultiRangeDownloader,
@@ -252,6 +253,73 @@ async def test_cat_file_warning_on_missing_persisted_size(
             result = await extended_gcsfs._cat_file(file_path, start=0, end=10)
             assert "Falling back to _info() to get the file size" in caplog.text
             assert result == json_data[:10]
+
+
+@pytest.mark.asyncio
+async def test_cat_file_passes_cache_type(extended_gcsfs, gcs_bucket_mocks):
+    """
+    Tests that cache_type and cache_source are propagated to _mrd_pool_cache.get.
+    """
+    with gcs_bucket_mocks(json_data, bucket_type_val=BucketType.ZONAL_HIERARCHICAL):
+        with mock.patch.object(
+            extended_gcsfs._mrd_pool_cache, "get", new_callable=mock.AsyncMock
+        ) as mock_get:
+            from gcsfs.zb_hns_utils import MRDPool
+
+            mock_mrd = mock.AsyncMock(spec=MRDPool)
+            mock_mrd.get_mrd.return_value.__aenter__.return_value.persisted_size = len(
+                json_data
+            )
+            mock_get.return_value = mock_mrd
+
+            with mock.patch.object(
+                extended_gcsfs, "_concurrent_mrd_fetch", new_callable=mock.AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = json_data[:10]
+                await extended_gcsfs._cat_file(
+                    file_path,
+                    start=0,
+                    end=10,
+                    cache_type="readahead",
+                )
+
+            mock_get.assert_awaited_once_with(
+                TEST_ZONAL_BUCKET,
+                file,
+                mock.ANY,
+                pool_size=mock.ANY,
+                cache_type="readahead",
+                cache_source="explicit",
+            )
+
+
+def test_resolve_cache_config():
+    """Tests _resolve_cache_config logic under various kwargs configurations."""
+    from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+
+    # 1. Both cache_type and cache_source already present
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config(
+        {"cache_type": "custom", "cache_source": "explicit"}
+    )
+    assert c_type == "custom"
+    assert c_source == "explicit"
+
+    # 2. Only cache_type provided (cache_source missing)
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config(
+        {"cache_type": "readahead"}
+    )
+    assert c_type == "readahead"
+    assert c_source == "explicit"
+
+    # 3. Neither provided (defaults resolved via _get_prefetcher_and_cache_config)
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config({})
+    assert c_type in ("none", "readahead")
+    assert c_source == "default"
+
+    # 4. kwargs is None
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config(None)
+    assert c_type in ("none", "readahead")
+    assert c_source == "default"
 
 
 @pytest.mark.asyncio
@@ -559,6 +627,51 @@ async def test_get_file_warning_on_missing_persisted_size(
             await async_gcs._get_file(file_path, str(lpath))
             assert "Falling back to _info() to get the file size" in caplog.text
             assert lpath.read_bytes() == json_data
+
+
+@pytest.mark.asyncio
+async def test_get_file_incomplete_download(
+    async_gcs, gcs_bucket_mocks, tmp_path, file_path
+):
+    """
+    Tests that _get_file raises ClientError and correctly removes the local file
+    when the downloaded bytes are less than the expected size.
+    """
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=BucketType.ZONAL_HIERARCHICAL):
+        lpath = tmp_path / "output.txt"
+
+        # Simulate download_range returning a shorter byte string than expected
+        # by returning some data on first call, then empty bytes (EOF) on subsequent calls.
+        # This ensures the download terminates early and raises ClientError, even if
+        # the expected size happens to be a multiple of the chunk size.
+        download_called = False
+
+        async def mock_download_range(*args, **kwargs):
+            nonlocal download_called
+            if not download_called:
+                download_called = True
+                return b"short"
+            return b""
+
+        with (
+            mock.patch(
+                "gcsfs.zb_hns_utils.download_range",
+                side_effect=mock_download_range,
+            ),
+            mock.patch.object(
+                async_gcs, "_info", new_callable=mock.AsyncMock
+            ) as mock_info,
+        ):
+            mock_info.return_value = {"size": len(json_data)}
+            with pytest.raises(
+                aiohttp.ClientError,
+                match="Expected .* bytes, but only received .* bytes",
+            ):
+                await async_gcs._get_file(file_path, str(lpath))
+
+            # The local file should not exist after the failed download
+            assert not lpath.exists()
 
 
 @pytest.mark.asyncio

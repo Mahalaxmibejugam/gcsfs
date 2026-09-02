@@ -3,6 +3,10 @@ import unittest.mock as mock
 import pytest
 
 from gcsfs.tests.perf.microbenchmarks import configs
+from gcsfs.tests.perf.microbenchmarks.comparison.configs import (
+    ComparisonConfigurator,
+    get_comparison_benchmark_cases,
+)
 from gcsfs.tests.perf.microbenchmarks.delete.configs import get_delete_benchmark_cases
 from gcsfs.tests.perf.microbenchmarks.glob.configs import get_glob_benchmark_cases
 from gcsfs.tests.perf.microbenchmarks.info.configs import (
@@ -14,6 +18,10 @@ from gcsfs.tests.perf.microbenchmarks.listing.configs import (
     get_listing_benchmark_cases,
 )
 from gcsfs.tests.perf.microbenchmarks.open.configs import get_open_benchmark_cases
+from gcsfs.tests.perf.microbenchmarks.put.configs import (
+    PutConfigurator,
+    get_put_benchmark_cases,
+)
 from gcsfs.tests.perf.microbenchmarks.read.configs import (
     ReadConfigurator,
     get_read_benchmark_cases,
@@ -157,6 +165,29 @@ def test_write_configurator(mock_config_dependencies):
     assert case.files == 2  # threads * processes
 
 
+def test_put_configurator(mock_config_dependencies):
+    """Test that PutConfigurator correctly builds benchmark parameters."""
+    common = {
+        "bucket_types": ["regional"],
+        "file_sizes_mb": [200],
+        "chunk_sizes_mb": [50],
+        "rounds": 1,
+    }
+    scenario = {"name": "put_test", "processes": [2], "threads": [1]}
+
+    configurator = PutConfigurator("dummy")
+    cases = configurator.build_cases(scenario, common)
+
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.name == "put_test_2procs_1threads_200MB_file_50MB_chunk_regional"
+    assert case.file_size_bytes == 200 * MB
+    assert case.chunk_size_bytes == 50 * MB
+    assert case.processes == 2
+    assert case.files == 2  # threads * processes
+    assert case.bucket_name == "test-bucket"
+
+
 def test_listing_configurator(mock_config_dependencies):
     """Test that ListingConfigurator correctly builds benchmark parameters."""
     common = {"bucket_types": ["regional"], "rounds": 1}
@@ -167,7 +198,32 @@ def test_listing_configurator(mock_config_dependencies):
         "depth": 2,
         "folders": [5],
         "files": [100],
-        "pattern": "prefix",
+        "pattern": "ls",
+    }
+
+    configurator = ListingConfigurator("dummy")
+    cases = configurator.build_cases(scenario, common)
+
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.name == "list_test_1procs_1threads_100files_2depth_5folders_ls_regional"
+    assert case.files == 100
+    assert case.depth == 2
+    assert case.folders == 5
+    assert case.pattern == "ls"
+
+
+def test_listing_configurator_walk_pattern(mock_config_dependencies):
+    """Test that ListingConfigurator preserves walk pattern in parameters and id."""
+    common = {"bucket_types": ["regional"], "rounds": 1}
+    scenario = {
+        "name": "walk_test",
+        "processes": [1],
+        "threads": [1],
+        "depth": 8,
+        "folders": [16],
+        "files": [256],
+        "pattern": "walk",
     }
 
     configurator = ListingConfigurator("dummy")
@@ -176,13 +232,9 @@ def test_listing_configurator(mock_config_dependencies):
     assert len(cases) == 1
     case = cases[0]
     assert (
-        case.name
-        == "list_test_1procs_1threads_100files_2depth_5folders_prefix_regional"
+        case.name == "walk_test_1procs_1threads_256files_8depth_16folders_walk_regional"
     )
-    assert case.files == 100
-    assert case.depth == 2
-    assert case.folders == 5
-    assert case.pattern == "prefix"
+    assert case.pattern == "walk"
 
 
 def test_info_configurator(mock_config_dependencies):
@@ -273,6 +325,39 @@ def test_validate_actual_yaml_configs():
         cases = get_open_benchmark_cases()
         assert len(cases) > 0, "Open config produced no cases"
 
+        # Put
+        cases = get_put_benchmark_cases()
+        assert len(cases) > 0, "Put config produced no cases"
+
         # Glob
         cases = get_glob_benchmark_cases()
         assert len(cases) > 0, "Glob config produced no cases"
+
+        # Comparison
+        cases = get_comparison_benchmark_cases()
+        assert len(cases) > 0, "Comparison config produced no cases"
+
+
+def test_comparison_configurator(mock_config_dependencies):
+    """Test that ComparisonConfigurator correctly builds benchmark parameters."""
+    common = {
+        "bucket_types": ["regional"],
+        "file_sizes_mb": [1024],
+        "chunk_sizes_mb": [50],
+        "threads": [4],
+        "rounds": 3,
+    }
+    scenario = {"name": "download_large_file"}
+
+    configurator = ComparisonConfigurator("dummy")
+    cases = configurator.build_cases(scenario, common)
+
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.scenario == "download_large_file"
+    assert case.file_size_bytes == 1024 * MB
+    assert case.chunk_size_bytes == 50 * MB
+    assert case.threads == 4
+    assert case.processes == 1
+    assert case.rounds == 3
+    assert case.bucket_type == "regional"

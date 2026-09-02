@@ -625,7 +625,7 @@ def pytest_addoption(parser):
 def pytest_ignore_collect(collection_path, config):
     path_str = str(collection_path)
 
-    if "gcsfs/tests/perf/microbenchmarks" in path_str:
+    if "gcsfs/tests/perf" in path_str:
         # If no benchmark flags are passed, ignore the entire directory immediately.
         if not (
             config.getoption("--run-benchmarks")
@@ -643,23 +643,30 @@ def pytest_ignore_collect(collection_path, config):
             "pipe",
             "open",
             "glob",
+            "put",
+            "comparison",
         }
 
-        # If only --run-benchmarks-infra is passed, ignore the actual benchmark subfolders.
+        path_parts = set(path_str.replace(os.sep, "/").split("/"))
+        is_test_file = os.path.basename(path_str).startswith("test_")
+        is_benchmark_test = (
+            is_test_file
+            and bool(benchmark_subdirs.intersection(path_parts))
+            and os.path.basename(os.path.dirname(path_str)) in benchmark_subdirs
+        )
+
+        # If only --run-benchmarks-infra is passed, ignore live benchmark tests.
         if config.getoption("--run-benchmarks-infra") and not config.getoption(
             "--run-benchmarks"
         ):
-            path_parts = set(path_str.replace(os.sep, "/").split("/"))
-            if benchmark_subdirs.intersection(path_parts):
+            if is_benchmark_test:
                 return True
 
         # If only --run-benchmarks is passed, ignore the unit tests.
         if config.getoption("--run-benchmarks") and not config.getoption(
             "--run-benchmarks-infra"
         ):
-            if os.path.basename(path_str).startswith("test_"):
-                path_parts = set(path_str.replace(os.sep, "/").split("/"))
-                if not benchmark_subdirs.intersection(path_parts):
-                    return True
+            if is_test_file and not is_benchmark_test:
+                return True
 
     return None

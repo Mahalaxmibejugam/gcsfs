@@ -10,6 +10,10 @@ configuration:
 Each test class within this module should focus on a specific filesystem operation
 that has been extended or modified to support HNS features, such as `mv` (rename)
 and `mkdir`.
+
+Test placement: keep real-GCS HNS behavior in this file. Standard-bucket
+integration behavior belongs in test_core.py; zonal-specific behavior belongs
+in zonal test modules such as test_zonal_file.py.
 """
 
 import uuid
@@ -445,6 +449,103 @@ class TestExtendedGcsFileSystemMkdir:
         assert gcsfs.exists(bucket_path)
         assert gcsfs._sync_lookup_bucket_type(bucket_path) is BucketType.HIERARCHICAL
 
+    def test_hns_mkdir_existing_file_error(self, gcs_hns):
+        """Test mkdir raises FileExistsError if a file exists at the path."""
+        gcsfs = gcs_hns
+        file_path = f"{TEST_HNS_BUCKET}/existing_file_mkdir_{uuid.uuid4().hex}.txt"
+        gcsfs.touch(file_path)
+        assert gcsfs.isfile(file_path)
+
+        with pytest.raises(FileExistsError, match="A file already exists"):
+            gcsfs.mkdir(file_path)
+
+
+class TestExtendedGcsFileSystemMakedirs:
+    """Integration tests for the makedirs method in ExtendedGcsFileSystem."""
+
+    def test_hns_makedirs_success(self, gcs_hns):
+        """Test successful HNS folder creation via makedirs."""
+        gcsfs = gcs_hns
+        base_dir = f"{TEST_HNS_BUCKET}/new_dir_integration_{uuid.uuid4().hex}"
+        dir_path = f"{base_dir}/nested/one_more"
+
+        gcsfs.makedirs(dir_path)
+        assert gcsfs.isdir(dir_path)
+        assert gcsfs.isdir(f"{base_dir}/nested")
+        assert gcsfs.isdir(base_dir)
+
+    def test_hns_makedirs_existing_dir_exist_ok_true(self, gcs_hns):
+        """Test makedirs when folder already exists and exist_ok=True (no-op)."""
+        gcsfs = gcs_hns
+        dir_path = f"{TEST_HNS_BUCKET}/existing_dir_makedirs_{uuid.uuid4().hex}"
+        gcsfs.mkdir(dir_path)
+        assert gcsfs.isdir(dir_path)
+
+        gcsfs.makedirs(dir_path, exist_ok=True)
+        assert gcsfs.isdir(dir_path)
+
+    def test_hns_makedirs_existing_dir_exist_ok_false(self, gcs_hns):
+        """Test makedirs raises FileExistsError if folder exists and exist_ok=False."""
+        gcsfs = gcs_hns
+        dir_path = f"{TEST_HNS_BUCKET}/existing_dir_makedirs_fail_{uuid.uuid4().hex}"
+        gcsfs.mkdir(dir_path)
+        assert gcsfs.isdir(dir_path)
+
+        with pytest.raises(FileExistsError):
+            gcsfs.makedirs(dir_path, exist_ok=False)
+
+    def test_hns_makedirs_existing_file_error(self, gcs_hns):
+        """Test makedirs raises FileExistsError if a file exists at the path."""
+        gcsfs = gcs_hns
+        file_path = f"{TEST_HNS_BUCKET}/existing_file_makedirs_{uuid.uuid4().hex}.txt"
+        gcsfs.touch(file_path)
+        assert gcsfs.isfile(file_path)
+
+        with pytest.raises(FileExistsError):
+            gcsfs.makedirs(file_path, exist_ok=True)
+
+        with pytest.raises(FileExistsError):
+            gcsfs.makedirs(file_path, exist_ok=False)
+
+    def test_makedirs_in_non_existent_bucket_fails(self, gcs_hns):
+        """Test that makedirs raises FileNotFoundError if the target bucket does not exist."""
+        gcsfs = gcs_hns
+        bucket_name = f"gcsfs-non-existent-{uuid.uuid4().hex[:12]}"
+        dir_path = f"{bucket_name}/some/nested/dir"
+
+        assert not gcsfs.exists(bucket_name)
+        with pytest.raises(FileNotFoundError, match="Bucket does not exist"):
+            gcsfs.makedirs(dir_path)
+
+    def test_makedirs_bucket_only_behavior(self, gcs_hns):
+        """Test makedirs on bucket-only paths raises FileNotFoundError if
+        bucket doesn't exist, and FileExistsError if exists and not exist_ok."""
+        gcsfs = gcs_hns
+        non_existent_bucket = f"gcsfs-non-existent-{uuid.uuid4().hex[:12]}"
+
+        # Case 1: Bucket does not exist
+        with pytest.raises(FileNotFoundError, match="Bucket does not exist"):
+            gcsfs.makedirs(non_existent_bucket)
+
+        # Case 2: Bucket exists
+        with pytest.raises(FileExistsError, match="Bucket already exists"):
+            gcsfs.makedirs(TEST_HNS_BUCKET, exist_ok=False)
+
+        gcsfs.makedirs(TEST_HNS_BUCKET, exist_ok=True)  # Should succeed silently
+
+    def test_hns_makedirs_with_protocol(self, gcs_hns):
+        """Test successful HNS folder creation via makedirs with protocol prefix."""
+        gcsfs = gcs_hns
+        base_dir = f"{TEST_HNS_BUCKET}/new_dir_protocol_{uuid.uuid4().hex}"
+        dir_path = f"gs://{base_dir}/nested/one_more"
+        stripped_dir_path = f"{base_dir}/nested/one_more"
+
+        gcsfs.makedirs(dir_path)
+        assert gcsfs.isdir(dir_path)
+        assert gcsfs.isdir(stripped_dir_path)
+        assert gcsfs.isdir(f"{base_dir}/nested")
+        assert gcsfs.isdir(base_dir)
+
 
 class TestExtendedGcsFileSystemRmdir:
     """Integration tests for the rmdir method in ExtendedGcsFileSystem."""
@@ -793,8 +894,8 @@ class TestExtendedGcsFileSystemRm:
 
     def test_rm_file_cache_invalidation(self, gcs_hns):
         """
-        Test that rm on a file invalidates the cache for the file's direct
-        parent and all ancestor directories, but not sibling directories.
+        Test that rm on a file in an HNS bucket updates the parent's cache in-place
+        (does not invalidate it) and does not invalidate sibling or ancestor directories.
         """
         gcsfs = gcs_hns
         base_dir = f"{TEST_HNS_BUCKET}/rm_file_cache_base"
@@ -816,13 +917,20 @@ class TestExtendedGcsFileSystemRm:
         gcsfs.rm(file_to_delete)
 
         # --- Assert Cache Invalidation ---
-        # The parent of the deleted file and all its ancestors should be invalidated.
+        # The parent of the deleted file should not be invalidated (it remains in dircache).
         assert (
-            parent_dir not in gcsfs.dircache
-        ), "Direct parent of deleted file should be invalidated."
+            parent_dir in gcsfs.dircache
+        ), "Direct parent of deleted file should not be invalidated."
+        # The deleted file itself should be removed from the parent's cache listing.
+        parent_listing = gcsfs.dircache[parent_dir]
+        assert not any(
+            e["name"] == file_to_delete for e in parent_listing
+        ), "Deleted file should be removed from parent's cache listing."
+
+        # Ancestor directories should also remain in cache.
         assert (
-            base_dir not in gcsfs.dircache
-        ), "Ancestor directory of deleted file should be invalidated."
+            base_dir in gcsfs.dircache
+        ), "Ancestor directory of deleted file should not be invalidated."
 
         # The cache for sibling directories should remain untouched.
         assert (
@@ -831,8 +939,8 @@ class TestExtendedGcsFileSystemRm:
 
     def test_rm_recursive_cache_invalidation(self, gcs_hns):
         """
-        Test that recursive rm invalidates the cache for the deleted directory,
-        its descendants, and its direct parent, but not unrelated directories.
+        Test that recursive rm in HNS bucket invalidates the cache for the deleted directory
+        and its descendants, and updates the direct parent's cache in-place (does not invalidate it).
         """
         gcsfs = gcs_hns
         base_dir = f"{TEST_HNS_BUCKET}/rm_rec_cache_base"
@@ -860,10 +968,16 @@ class TestExtendedGcsFileSystemRm:
             nested_dir not in gcsfs.dircache
         ), "Descendant of deleted dir should be gone."
 
-        # The direct parent's cache should be invalidated.
+        # The direct parent's cache should not be invalidated (it remains in dircache).
         assert (
-            base_dir not in gcsfs.dircache
-        ), "Parent of deleted dir should be invalidated."
+            base_dir in gcsfs.dircache
+        ), "Parent of deleted dir should not be invalidated."
+
+        # The deleted directory should be removed from the parent's listing.
+        parent_listing = gcsfs.dircache[base_dir]
+        assert not any(
+            e["name"] == dir_to_delete for e in parent_listing
+        ), "Deleted directory should be removed from parent's cache listing."
 
         # The cache for sibling directories should remain untouched.
         assert (
@@ -1011,6 +1125,80 @@ class TestExtendedGcsFileSystemRm:
                     pass
 
 
+class TestExtendedGcsFileSystemWriteCacheInvalidation:
+    """Integration tests for write-path (pipe/put) dircache updates.
+
+    Writing a file invalidates only its immediate parent's listing when that
+    parent is already cached (and therefore known to exist); otherwise it falls
+    back to invalidating the parent and all of its ancestors. This behavior is
+    bucket-type-agnostic, so it is exercised on both HNS and standard buckets.
+    """
+
+    def test_write_file_cache_invalidates_only_immediate_parent_hns(self, gcs_hns):
+        """On an HNS bucket, writing into a cached directory invalidates only
+        that immediate parent (so the new file is re-listed), leaving ancestor
+        and sibling caches untouched."""
+        gcsfs = gcs_hns
+        base_dir = f"{TEST_HNS_BUCKET}/write_cache_hns_{uuid.uuid4().hex}"
+        parent_dir = f"{base_dir}/parent"
+        sibling_dir = f"{base_dir}/sibling"
+        new_file = f"{parent_dir}/new.txt"
+
+        # --- Setup ---
+        gcsfs.touch(f"{parent_dir}/existing.txt")
+        gcsfs.touch(f"{sibling_dir}/sibling_file.txt")
+
+        # --- Populate Cache ---
+        gcsfs.ls(base_dir)
+        gcsfs.ls(parent_dir)
+        gcsfs.ls(sibling_dir)
+        assert base_dir in gcsfs.dircache
+        assert parent_dir in gcsfs.dircache
+        assert sibling_dir in gcsfs.dircache
+
+        # --- Perform write ---
+        gcsfs.pipe_file(new_file, b"hello world")
+
+        # The immediate parent is invalidated so its next listing re-reads it.
+        assert (
+            parent_dir not in gcsfs.dircache
+        ), "Immediate parent of written file should be invalidated."
+        # Ancestor and sibling caches are left untouched.
+        assert (
+            base_dir in gcsfs.dircache
+        ), "Ancestor directory should not be invalidated on write."
+        assert (
+            sibling_dir in gcsfs.dircache
+        ), "Sibling directory cache should not be invalidated on write."
+
+        # The new file is visible once the parent is re-listed.
+        assert new_file in gcsfs.ls(parent_dir, detail=False)
+
+    def test_write_file_uncached_parent_invalidates_ancestors(self, gcs_hns):
+        """Writing the first file into a not-yet-cached directory invalidates the
+        cached ancestor, so the newly created directory is picked up on re-list
+        rather than being hidden behind a stale ancestor listing."""
+        gcsfs = gcs_hns
+        base_dir = f"{TEST_HNS_BUCKET}/write_cache_uncached_{uuid.uuid4().hex}"
+        new_dir = f"{base_dir}/newdir"
+        new_file = f"{new_dir}/new.txt"
+
+        # --- Setup & cache the ancestor only ---
+        gcsfs.touch(f"{base_dir}/seed.txt")
+        gcsfs.ls(base_dir)
+        assert base_dir in gcsfs.dircache
+        assert new_dir not in gcsfs.dircache
+
+        # --- Write into the uncached (newly created) subdirectory ---
+        gcsfs.pipe_file(new_file, b"data")
+
+        # The cached ancestor is invalidated so a re-list reflects the new dir.
+        assert (
+            base_dir not in gcsfs.dircache
+        ), "Cached ancestor should be invalidated when the parent was uncached."
+        assert new_dir in gcsfs.ls(base_dir, detail=False)
+
+
 @pytest.fixture()
 def test_structure(gcs_hns):
     """Sets up a standard directory structure for find tests and cleans it up afterward."""
@@ -1150,6 +1338,25 @@ class TestExtendedGcsFileSystemFindIntegration:
             d["name"] for d in gcs_hns.dircache[test_structure["empty_dir"]]
         }
         assert not empty_dir_listing
+
+    @pytest.mark.parametrize("withdirs_param", [True, False])
+    def test_find_updates_dircache_for_root_bucket(
+        self, gcs_hns, test_structure, withdirs_param
+    ):
+        """Test that find() populates the dircache for the root bucket itself."""
+        root_bucket = TEST_HNS_BUCKET
+        gcs_hns.invalidate_cache()
+        assert not gcs_hns.dircache
+
+        # Run find on the root bucket to populate the cache
+        gcs_hns.find(root_bucket, withdirs=withdirs_param)
+
+        # Verify that the cache is now populated for the root bucket
+        assert root_bucket in gcs_hns.dircache
+        root_bucket_listing = {
+            d["name"].rstrip("/") for d in gcs_hns.dircache[root_bucket]
+        }
+        assert root_bucket_listing == {test_structure["base_dir"]}
 
     def test_find_maxdepth_updates_cache(self, gcs_hns, test_structure):
         """Test that find with maxdepth updates cache for deeper objects."""

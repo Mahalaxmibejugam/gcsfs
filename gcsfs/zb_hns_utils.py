@@ -19,29 +19,64 @@ from google.cloud.storage.asyncio.async_multi_range_downloader import (
 )
 
 MRD_MAX_RANGES = 1000  # MRD supports up to 1000 ranges per request
-DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_GCSFS_CONCURRENCY", "1"))
+try:
+    DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_GCSFS_CONCURRENCY", "4"))
+except ValueError:
+    DEFAULT_CONCURRENCY = 4
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
 
 
-PyBytes_FromStringAndSize = ctypes.pythonapi.PyBytes_FromStringAndSize
-PyBytes_FromStringAndSize.argtypes = (ctypes.c_void_p, ctypes.c_ssize_t)
-PyBytes_FromStringAndSize.restype = ctypes.py_object
+try:
+    PyBytes_FromStringAndSize = ctypes.pythonapi.PyBytes_FromStringAndSize
+    PyBytes_FromStringAndSize.argtypes = (ctypes.c_void_p, ctypes.c_ssize_t)
+    PyBytes_FromStringAndSize.restype = ctypes.py_object
 
-PyBytes_AsString = ctypes.pythonapi.PyBytes_AsString
-PyBytes_AsString.argtypes = (ctypes.py_object,)
-PyBytes_AsString.restype = ctypes.c_void_p
+    PyBytes_AsString = ctypes.pythonapi.PyBytes_AsString
+    PyBytes_AsString.argtypes = (ctypes.py_object,)
+    PyBytes_AsString.restype = ctypes.c_void_p
+    HAS_CPYTHON_API = True
+except Exception:
+    PyBytes_FromStringAndSize = None
+    PyBytes_AsString = None
+    HAS_CPYTHON_API = False
 
 
-async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
+async def init_mrd(
+    grpc_client,
+    bucket_name,
+    object_name,
+    generation=None,
+    cache_type=None,
+    cache_source=None,
+):
     """
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
     """
+    from gcsfs.core import _get_cache_type_header_value
+
+    metadata = None
+    cache_val = _get_cache_type_header_value(cache_type, cache_source)
+    if cache_val:
+        metadata = [("x-goog-api-client", cache_val)]
+
+    kwargs = {}
+    if metadata:
+        kwargs["metadata"] = metadata
+
     try:
         return await AsyncMultiRangeDownloader.create_mrd(
-            grpc_client, bucket_name, object_name, generation
+            grpc_client, bucket_name, object_name, generation, **kwargs
         )
+    except TypeError as e:
+        if "metadata" in str(e):
+            # TODO: Remove this fallback once the latest google-cloud-storage
+            # SDK is released with support for the metadata argument.
+            return await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, bucket_name, object_name, generation
+            )
+        raise
     except NotFound:
         # We wrap the error here to match standard Python error handling
         # and avoid leaking Google API exceptions to users.
@@ -344,10 +379,16 @@ class DirectMemmoveBuffer:
                         fut.set_result(None)
                         self._total_bytes_written += size
                         return fut
-                    self._result_bytes = PyBytes_FromStringAndSize(
-                        None, self.expected_size
-                    )
-                    self._start_address = PyBytes_AsString(self._result_bytes)
+                    if HAS_CPYTHON_API:
+                        self._result_bytes = PyBytes_FromStringAndSize(
+                            None, self.expected_size
+                        )
+                        self._start_address = PyBytes_AsString(self._result_bytes)
+                    else:
+                        self._result_bytes = bytearray(self.expected_size)
+                        self._start_address = (
+                            -1
+                        )  # Dummy value to pass the defensive check below
 
                 # Defensive programming: gracefully catch internal overwrite attempts
                 if self._start_address is None:
@@ -355,7 +396,6 @@ class DirectMemmoveBuffer:
                         "Attempted to execute standard write over a Zero-Copied payload."
                     )
 
-                dest = self._start_address + dest_offset
                 if self._pending_count == 0:
                     self._done_event.clear()
                 self._pending_count += 1
@@ -367,7 +407,7 @@ class DirectMemmoveBuffer:
         if size <= self.THRESHOLD_BYTES_FOR_SCHEDULING:
             # Fast path, no need to send it to executor
             try:
-                self._do_memmove(dest, data_bytes, size)
+                self._do_memmove(dest_offset, data_bytes, size)
             except BaseException:
                 # The exception is already captured in self._error by _do_memmove
                 pass
@@ -382,20 +422,31 @@ class DirectMemmoveBuffer:
         else:
             try:
                 # Slow path, schedule it on executor.
-                return self.executor.submit(self._do_memmove, dest, data_bytes, size)
+                return self.executor.submit(
+                    self._do_memmove, dest_offset, data_bytes, size
+                )
             except BaseException as e:
                 with self._lock:
                     self._error = e
                 self._decrement_pending()
                 raise e
 
-    def _do_memmove(self, dest, data_bytes, size):
+    def _do_memmove(self, dest_offset, data_bytes, size):
         try:
             with self._lock:
                 if self._error:
                     return
 
-            ctypes.memmove(dest, data_bytes, size)
+            # Isolate pointer math to CPython only.
+            # PyPy uses memory-safe native slice assignment.
+            if HAS_CPYTHON_API:
+                dest = self._start_address + dest_offset
+                ctypes.memmove(dest, data_bytes, size)
+            else:
+                memoryview(self._result_bytes)[
+                    dest_offset : dest_offset + size
+                ] = data_bytes
+
             with self._lock:
                 self._total_bytes_written += size
 
@@ -421,6 +472,10 @@ class DirectMemmoveBuffer:
                     f"only populated {self._total_bytes_written}. Returning this "
                     f"payload would leak uninitialized memory."
                 )
+
+            if not isinstance(self._result_bytes, bytes):
+                return bytes(self._result_bytes)
+
             return self._result_bytes
 
     def close(self):
@@ -465,21 +520,31 @@ class MRDPool:
         bucket_name,
         object_name,
         generation,
+        finalized,
         pool_size,
         cache=None,
+        cache_type=None,
+        cache_source=None,
     ):
         self.gcsfs = gcsfs
         self.bucket_name = bucket_name
         self.object_name = object_name
         self.generation = generation
         self._cache = cache
-        self._key = (bucket_name, object_name, generation)
+        self.cache_type = cache_type
+        # Note: MRDPool is shared across requests with different cache configs.
+        # self.cache_source reflects the originator of the pool. Dynamic scale-up
+        # operations (_create_mrd) will emit this initial cache_source telemetry,
+        # even if triggered by a request with a different cache_source.
+        self.cache_source = cache_source
+        self._key = (bucket_name, object_name, generation, cache_type)
         self.pool_size = pool_size
         self._free_mrds = asyncio.Queue(maxsize=pool_size)
         self._active_count = 0
         self._lock = asyncio.Lock()
         self.details = None
         self.persisted_size = None
+        self.finalized = finalized
         self._initialized = False
         self._closed = False
 
@@ -514,7 +579,12 @@ class MRDPool:
     async def _create_mrd(self):
         await self.gcsfs._get_grpc_client()
         mrd = await init_mrd(
-            self.gcsfs.grpc_client, self.bucket_name, self.object_name, self.generation
+            self.gcsfs.grpc_client,
+            self.bucket_name,
+            self.object_name,
+            self.generation,
+            cache_type=self.cache_type,
+            cache_source=self.cache_source,
         )
         return mrd
 
@@ -535,9 +605,12 @@ class MRDPool:
                 raise RuntimeError("Cannot initialize a closed MRDPool.")
 
             if not self._initialized and self._active_count == 0:
-                # Always create a new MRD on initialization to get the up-to-date persisted_size
-                mrd = await self._create_mrd()
-                self._all_mrds.append(mrd)
+                if self.finalized:
+                    mrd = await self._get_or_create_mrd()
+                else:
+                    # Always create a new MRD for unfinalized objects to get the up-to-date persisted_size
+                    mrd = await self._create_mrd()
+                    self._all_mrds.append(mrd)
                 self.persisted_size = mrd.persisted_size
                 self._free_mrds.put_nowait(mrd)
                 self._active_count += 1
@@ -709,7 +782,15 @@ class MRDPoolCache:
             mrds_to_close.extend(_drain_queue(self._mrd_queues.pop(evict_key, None)))
         return mrds_to_close
 
-    async def get(self, bucket_name, object_name, generation, pool_size):
+    async def get(
+        self,
+        bucket_name,
+        object_name,
+        generation,
+        pool_size,
+        cache_type=None,
+        cache_source=None,
+    ):
         """
         Gets an MRDPool for the specified object.
 
@@ -718,6 +799,8 @@ class MRDPoolCache:
             object_name (str): Name of the object.
             generation (int): Object generation.
             pool_size (int): Requested pool size.
+            cache_type (str, optional): The cache type string.
+            cache_source (str, optional): The cache source string.
 
         Returns:
             MRDPool: An initialized MRDPool instance.
@@ -728,11 +811,11 @@ class MRDPoolCache:
         if fs is None:
             raise RuntimeError("ExtendedGcsFileSystem has been garbage collected.")
 
-        info = None
+        info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
         if generation is None:
-            info = await fs._info(f"{bucket_name}/{object_name}")
             generation = info.get("generation")
-        key = (bucket_name, object_name, generation)
+        key = (bucket_name, object_name, generation, cache_type)
+        finalized = info.get("timeFinalized") is not None
 
         self._incref(key)
         mrd_pool = MRDPool(
@@ -740,8 +823,11 @@ class MRDPoolCache:
             bucket_name,
             object_name,
             generation,
+            finalized,
             pool_size,
             cache=self,
+            cache_type=cache_type,
+            cache_source=cache_source,
         )
         if info is not None:
             mrd_pool.details = info

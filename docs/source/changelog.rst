@@ -4,6 +4,158 @@ Changelog
 Note: in some releases, there are no changes, because we always guarantee
 releasing in step with fsspec.
 
+2026.8.0
+--------
+
+**Adaptive Concurrent Prefetching is now the default read path**
+
+**Enhanced read path via adaptive concurrent prefetching is now the default  in GCSFS.**
+Starting with this version, GCSFS predicts the next byte range an application will read, fetches it in the background across several concurrent HTTP requests, and keeps the bytes in memory before next read() is called. Network round-trips overlap with application compute instead of blocking calls where compute has to wait for data to be fetched. We are also enabling read concurrency, so a single reader is no longer limited by the bandwidth of a single HTTP connection.
+
+GCSFS prefetcher adapts to workload read IO patterns. It tracks the rolling average of recent read sizes and scales the prefetch window linearly with the detected sequential streak, rather than using a fixed block size or exponential doubling. This is inline to what modern Linux kernels will do to balance prefetch and memory footprint. When the pattern turns random read i.e. we are not able to leverage the prefetched buffer to answer the next read() call, it drains the buffer to zero, so that random-access workloads pay no bandwidth or memory penalty.
+
+**Why this matters for AI/ML workloads**
+
+* **Model loading and checkpoint restore are typically large sequential reads - and prefetcher shines there.** In our benchmarking, a single-stream sequential throughput improved from 23.69 MB/s to 658.71 MB/s for 1 MB I/O, and from 156 MB/s to 736 MB/s for 16 MB I/O.
+* **Training data pipelines stay fed.** Parquet and sharded dataset reads issue small-to-medium sequential ranges that previously suffered from low throughput, but now achieve significantly more; at 16 MB I/O throughput rises from 150 MB/s to 730 MB/s. Reducing the wait time for data loading improves accelerator goodput(amount of time accelerator is utilised for training than waiting).
+* **Multi-worker dataloader scaling.** The prefetcher manufactures its own parallelism per worker instead of relying on process count alone.
+* **Accelerate the throughput even further with Rapid Buckets.** With Rapid Buckets single node throughput reaches 21 GiB/s with  16-process sequentially reading at 16 MiB I/O compared to standard buckets with 48processes.
+
+**Adaptive prefetcher is enabled by default** when cache_type is not explicitly set and concurrency value is set at 4(DEFAULT_GCSFS_CONCURRENCY=4) for both Standard and Rapid buckets. You can disable adaptive prefetcher by setting an explicit cache_type, or by setting  USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING='false', or by passing use_experimental_adaptive_prefetching=False to open() call.
+
+**(Warning) Impact on memory:** Prefetching trades memory for throughput. Peak memory rises from ~170 MB to 600 MB on single-stream reads for 16 MB IO size and varies with requested IO sizes, and would be materially more under high process counts. Please ensure that   application memory  limits accordingly to use prefetcher without any Out of Memory(OOM) issues. To put hard limit, you can also use [user_max_prefetch_size](https://github.com/fsspec/gcsfs/blob/main/gcsfs/prefetcher.py#L154)
+
+For  details on architecture, tuning, full benchmark tables, along with known limitations please refer to : https://github.com/fsspec/gcsfs/blob/main/docs/source/prefetcher.rst
+
+(#795, #805, #818, #877)
+
+**Bug Fixes & Improvements**
+
+* Zero-cost local backward seeks in PrefetchConsumer - Parquet footer and ZIP directory reads are served from the existing buffer instead of re-issuing a network request. (#930)
+* Concurrent downloads cap task count against a minimum chunk size, removing per-task overhead on small ranges. (#926)
+* Generation consistency across parallel fetches, guaranteeing every chunk comes from the same object version. (#921)
+* Fixed silent truncation on short reads in zonal bucket downloads. (#920)
+* Zero-copy read and write paths via memoryview, cutting CPU and transient memory in the hot path. (#840, #907, #928)
+* Graceful fallback where ctypes.pythonapi is unavailable. (#938)
+
+
+2026.7.0
+--------
+
+* fix(macrobenchmarks): fix cloud build machine type networkPerformanceConfig error (#951)
+* fix(macrobenchmarks): use random optimizer moments, not zeros, in CPU sim (#949)
+* test(macrobench): use default DDP timeout in llama CPU simulation (#947)
+* Update release process documentation (#945)
+* Add permissions and path filters to release-on-merge workflow (#944)
+* fix(cleanup): retry GKE cluster deletion on failure (#943)
+* fix(macrobenchmarks): remove HNS validation and external model bucket check (#942)
+* fix: seed timer at training start to avoid AttributeError (#941)
+* Automate monthly release process (#916)
+* refactor(macrobench): share helm args and update cloudbuild config (#940)
+* test(perf): add microbenchmarks for put operations (#939)
+* Update benchmarking tables schema and values under ReadAhead Cache (#934)
+* support environment where ctypes.pythonapi is not available (#938)
+* Enhance CPU simulator logging and throughput metrics (#937)
+* ci: isolate macrobenchmark GKE cluster in a dedicated VPC network (#933)
+* macrobenchmarks: parameterize macrobenchmarks (#936)
+* macrobenchmarks: add checkpoint seeding and reduce emulator ranks to 4 (#935)
+* Implement zero-cost local backward seeks in PrefetchConsumer (#930)
+* Add cache_type in user-agent fo http client  (#908)
+* Fix root cache invalidation (#931)
+* Use memoryview to enable zero-copy in _pipe_file (#928)
+* Fix ValueError message for invalid access in GCSFileSystem (#932)
+* feat(macrobench): add BigQuery ingestion pipeline with dynamic schema evolution (#915)
+* Fix silent truncation on short reads in zonal bucket downloads (#920)
+* Fix generation threading in gcsfs url and concurrent fetches (#921)
+* macrobenchmarks: Parameterize training strategy and simulated step compute; generalize requirements (#927)
+* Implement makedirs for HNS buckets (#906)
+* docs: update benchmarking sections with single-threaded data (#925)
+* Optimize concurrent downloads by capping task count based on minimum chunk size (#926)
+* ci: add macrobenchmark infrastructure unit tests (#924)
+* prefetcher docs: update no cache benchmark tables for Standard buckets (#922)
+* perf(benchmarks): increase pipe benchmark size and exclude setup overhead from write benchmark (#917)
+* feat(macrobench): add metrics calculation and summary assembly engine (#913)
+* feat(macrobench): add metrics extraction and storage engine (#912)
+* feat(macrobench): add GKE orchestration scripts and Cloud Build pipeline (#914)
+* feat(macrobench): add Llama 3.1 8B CPU simulator workload (hf-pytorch-lightning-cpu) (#911)
+* Update prefetcher.rst with Rapid Buckets performance numbers (#909)
+* fix: force schema recreation for staging external table in ingestion pipeline (#910)
+* Implement zero-copy in write path of standard bucket (#907)
+* updated latest fsspec version in pyproject.toml (#903)
+* chore: update build configurations and database schema (#904)
+* Remove GCE_METADATA_MTLS_MODE export from e2e pipeline (#905)
+* chore(benchmarks): make create-vm wait for cleanup-leaked-resources (#902)
+* Remove 48 process rapid read benchmark (#901)
+* Fix order-independent assertion in test_read_block_zb (#897)
+
+2026.6.0
+--------
+
+* check finalized state to optimize MRD pool initialization (#896)
+* fix streaming upload alignment for non-final chunks (#894)
+* optimize _rm batchsize and speed up tests (#893)
+* optimize E2E tests: parallelize resource creation and enable parallel test execution (#892)
+* fix CPU and Memory monitoring aggregation logic (#891)
+* update Codecov config (#890)
+* remove mrd_supports_multi_request and assume it's always true (#884)
+* fix multi-process benchmark child process crash handling (#883)
+* fix ZonalFile generation parameter overwriting (#882)
+* fix ResourceMonitor thread shutdown latency affecting benchmark durations (#881)
+* fix generation parameter not forwarded to GCSFile in open() (#880)
+* route GCSMap through dynamically resolved GCSFileSystem (#879)
+* fix multiple _info() calls in _process_limits_to_offset_and_length (#878)
+* introduce async API in Prefetcher and integrate it with disk reads (#877)
+* clean up zonal/HNS test markers and GHA exports (#876)
+* cache metadata details from MRDPoolCache info lookup to avoid redundant network calls (#874)
+* add a comprehensive performance micro-benchmark suite targeting fs.glob() (#873)
+* refactor directory cache updates and optimize caching logic (#870)
+* create flat bucket dynamically (#869)
+* enable exp reads (#868)
+* clean up duplicate tests (#867)
+* block release pipeline on Google Cloud Build E2E integration tests (#866)
+* use conda-forge for docs to avoid Anaconda SSL error (#865)
+* add log for download range for Rapid Bucket (#863)
+* update read performance microbenchmark config to use 1 file (#861)
+* add open microbenchmark (#860)
+* fix multiprocessing emulator _get_bucket_type calls (#859)
+* merge HNS and flat bucket deletion routing in rm (#858)
+* fix teardown order in close_resources() (#857)
+* refcount in-flight MRDs in MRDPool (#856)
+* fix off-by-one error in upload_chunk shortfall recursion (#855)
+* fix concurrent MRD reuse by tracking in-flight MRDs on close (#854)
+* fix swapped arguments in _process_object inside inventory_report.py (#853)
+* optimize benchmarks pipeline, fix quota leaks and handle manual builds (#851)
+* update default value of mrd_pool_size in micro benchmark to None and add pool parameters to benchmark schema (#850)
+* fix BigQuery ingestion errors and improve Cloud Build robustness (#849)
+* use pytest markers to gate Rapid/HNS tests (#848)
+* fix Storage Control endpoint resolution for TPC (#847)
+* add mrd pool cache (#846)
+* run tests concurrently in CI (#845)
+* document intentional non-caching and fallback behavior for UNKNOWN bucket layouts (#844)
+* improve test speed and emulator compatibility (#843)
+* add Pipe function in microbenchmark (#842)
+* add support for testing against fsspec HEAD (#841)
+* implement zero-copy optimization for single-read operations (#840)
+* pass trailing / to createFolder as per documentation (#839)
+* add multi-threaded fixed-duration read microbenchmarks (#838)
+* remove fsspec exclusion following prefix fix (#837)
+* add mixed pattern in gcsfs microbenchmarks (#822)
+* refactor prefetcher code (#818)
+
+2026.5.0
+--------
+
+* add pypi environment to release workflow (#836)
+* fix HttpError message formatting and handle None content in validate_response (#835)
+* adjust fsspec dependency version constraint (#834)
+* add support for partial prefixes in find method for HNS buckets (#831)
+* fix issue with special characters in rm method (#831)
+* update zonal doc (#828)
+* add workflow to automate PyPI package publishing on release (#824)
+* enable branch-wise tracking in benchmarks (#819)
+* update the benchmark config, and fix the block size propagation (#808)
+* integrate prefetcher engine with zonal buckets (#805)
+
 2026.4.0
 --------
 

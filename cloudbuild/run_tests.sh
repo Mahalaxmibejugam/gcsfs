@@ -2,12 +2,6 @@
 set -e
 source env/bin/activate
 
-# Temporary workaround: Disable mTLS for GCE Metadata Server discovery to avoid
-# transport and SSL verification errors on mTLS-enabled VMs. This ensures
-# stability across all Google SDKs while library-level mTLS fixes are finalized.
-# This is added to support the versioned tests
-export GCE_METADATA_MTLS_MODE=none
-
 # Common Exports
 export STORAGE_EMULATOR_HOST=https://storage.googleapis.com
 export GCSFS_TEST_PROJECT=${PROJECT_ID}
@@ -21,7 +15,14 @@ ARGS=(
   "--log-format=%(asctime)s %(levelname)s %(message)s"
   "--log-date-format=%H:%M:%S"
   --color=no
+  --durations=50
 )
+
+PYTEST_XDIST_WORKERS="${PYTEST_XDIST_WORKERS:-1}"
+if ! [[ "${PYTEST_XDIST_WORKERS}" =~ ^[0-9]+$ ]] || (( PYTEST_XDIST_WORKERS <= 0 )); then
+  PYTEST_XDIST_WORKERS=1
+fi
+ARGS+=(-n "${PYTEST_XDIST_WORKERS}")
 
 echo "--- Running Test Suite: ${TEST_SUITE} ---"
 

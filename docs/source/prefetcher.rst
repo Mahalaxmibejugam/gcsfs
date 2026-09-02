@@ -2,8 +2,7 @@
 GCSFS Adaptive Concurrent Prefetching: Architecture & Usage Guide
 =================================================================
 
-This feature is entirely experimental! To activate, you need to pass the environment variable
-`USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING='true'` and `DEFAULT_GCSFS_CONCURRENCY`=4. As currently written, this implementation is
+Prefetcher is enabled by default when cache_type is not set explicitly with `DEFAULT_GCSFS_CONCURRENCY=4`. To disable, you can pass the environment variable `USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING='false'` or pass `use_experimental_adaptive_prefetching=False` when opening a file. As currently written, this implementation is
 separate from the fsspec-style caching layer, but the intent is to eventually make this available to all
 asynchronous filesystems using the standard `cache_type=` argument. How it interacts with the
 existing cache types ("readahead", "first", etc.) remains to be decided, and in the meantime, use at your own risk.
@@ -71,17 +70,30 @@ Interaction with GCSFile
 
 The prefetcher is integrated into the ``GCSFile`` and replaces the standard sequential fetching mechanism when enabled.
 
-Enabling the Feature
---------------------
+Feature Configuration & Disabling
+---------------------------------
 
-To use this architecture, set the following environment variables:
+Adaptive prefetching is enabled by default when ``cache_type`` is not explicitly set by the user, using ``DEFAULT_GCSFS_CONCURRENCY=4``.
+
+Prefetching can be disabled in three ways:
+
+1. Explicitly specify a ``cache_type`` when opening a file (e.g., ``cache_type="readahead"`` or ``cache_type="none"`` or any other cache_type):
+
+.. code-block:: python
+
+    gcs.open("bucket/file.txt", "rb", cache_type="readahead")
+
+2. Set the environment variable:
 
 .. code-block:: bash
 
-    export DEFAULT_GCSFS_CONCURRENCY=4
-    export USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING='true'
+    export USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING='false'
 
-We recommend setting ``cache_type="none"`` for optimal results. The engine avoids prefetching for random workloads, and other cache types create unnecessary memory copies that degrade performance.
+3. Pass ``use_experimental_adaptive_prefetching=False`` directly when opening a file:
+
+.. code-block:: python
+
+    gcs.open("bucket/file.txt", "rb", use_experimental_adaptive_prefetching=False)
 
 Under the Hood Lifecycle
 ------------------------
@@ -92,8 +104,8 @@ Under the Hood Lifecycle
 * The prefetcher returns requested bytes from its local queue while the producer continues pulling chunks from GCS.
 * Calling ``file.close()`` triggers ``_prefetch_engine.close()``, safely canceling pending network tasks and clearing memory buffers to prevent memory leaks.
 
-Benchmarking with No Cache
---------------------------
+Standard Buckets Benchmarking with No Cache
+-------------------------------------------
 
 Single Stream Performance (1 Process)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -141,8 +153,8 @@ Multi Stream Performance (48 Process)
 | rand    | 100.00       | 8932.10         | 12550.82        | 12968.84                 | 15041.77         | 18421.29         | 18508.52                 |
 +---------+--------------+-----------------+-----------------+--------------------------+------------------+------------------+--------------------------+
 
-Benchmarking with ReadAhead Cache
----------------------------------
+Standard Buckets Benchmarking with Default ReadAhead Cache
+----------------------------------------------------------
 
 Single Stream Performance (1 Process)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -189,6 +201,104 @@ Multi Stream Performance (48 Process)
 +---------+--------------+-----------------+-----------------+--------------------------+------------------+------------------+--------------------------+
 | rand    | 100.00       | 8276.16         | 10171.59        | 10172.54                 | 20621.17         | 23598.05         | 24086.18                 |
 +---------+--------------+-----------------+-----------------+--------------------------+------------------+------------------+--------------------------+
+
+Rapid Buckets Benchmarking with default ReadAhead cache
+-------------------------------------------------------
+
+Single Stream Performance (1 Process)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
++---------+--------------+-------------------+--------------+-------------+
+| Pattern | IO Size (MiB)| Throughput (MiB/s)| Max Mem (MiB)| Max CPU (%) |
++=========+==============+===================+==============+=============+
+| seq     | 0.06         | 709.47            | 3898.87      | 0.92        |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 1.00         | 1063.34           | 1910.32      | 0.97        |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 16.00        | 1348.37           | 2019.41      | 1.24        |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 100.00       | 746.67            | 2700.23      | 1.21        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 0.06         | 5.84              | 2289.79      | 0.55        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 1.00         | 64.93             | 2179.14      | 0.49        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 16.00        | 623.79            | 2253.23      | 0.75        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 100.00       | 1335.33           | 2558.62      | 1.41        |
++---------+--------------+-------------------+--------------+-------------+
+
+Multi Stream Performance (16 Processes)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
++---------+--------------+-------------------+--------------+-------------+
+| Pattern | IO Size (MiB)| Throughput (MiB/s)| Max Mem (MiB)| Max CPU (%) |
++=========+==============+===================+==============+=============+
+| seq     | 0.06         | 10416.80          | 14869.36     | 17.74       |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 1.00         | 11215.91          | 14282.21     | 18.20       |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 16.00        | 12532.69          | 17202.97     | 21.18       |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 100.00       | 8447.33           | 25354.48     | 19.58       |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 0.06         | 87.49             | 8445.38      | 8.55        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 1.00         | 1143.84           | 8316.45      | 7.83        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 16.00        | 8256.43           | 10901.46     | 13.04       |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 100.00       | 14483.47          | 13797.95     | 24.56       |
++---------+--------------+-------------------+--------------+-------------+
+
+Rapid Buckets Benchmarking with none cache_type
+-----------------------------------------------
+
+Single Stream Performance (1 Process)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
++---------+--------------+-------------------+--------------+-------------+
+| Pattern | IO Size (MiB)| Throughput (MiB/s)| Max Mem (MiB)| Max CPU (%) |
++=========+==============+===================+==============+=============+
+| seq     | 0.06         | 338.32            | 418.56       | 0.85        |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 1.00         | 1256.67           | 493.22       | 1.18        |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 16.00        | 2058.56           | 762.40       | 1.42        |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 100.00       | 2007.20           | 989.16       | 1.77        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 0.06         | 42.83             | 698.52       | 0.59        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 1.00         | 268.29            | 627.70       | 1.12        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 16.00        | 1126.29           | 697.20       | 1.39        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 100.00       | 1786.80           | 870.89       | 1.56        |
++---------+--------------+-------------------+--------------+-------------+
+
+Multi Stream Performance (16 Processes)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
++---------+--------------+-------------------+--------------+-------------+
+| Pattern | IO Size (MiB)| Throughput (MiB/s)| Max Mem (MiB)| Max CPU (%) |
++=========+==============+===================+==============+=============+
+| seq     | 0.06         | 4417.29           | 8670.70      | 11.90       |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 1.00         | 14176.76          | 9095.18      | 19.01       |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 16.00        | 19369.49          | 13485.31     | 26.84       |
++---------+--------------+-------------------+--------------+-------------+
+| seq     | 100.00       | 17205.33          | 14212.22     | 30.12       |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 0.06         | 644.09            | 4435.87      | 3.92        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 1.00         | 2904.06           | 4562.50      | 5.33        |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 16.00        | 13465.60          | 8496.34      | 14.47       |
++---------+--------------+-------------------+--------------+-------------+
+| rand    | 100.00       | 16107.60          | 10651.09     | 27.58       |
++---------+--------------+-------------------+--------------+-------------+
 
 Seeing the Prefetcher in Action
 ===============================

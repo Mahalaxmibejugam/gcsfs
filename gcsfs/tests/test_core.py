@@ -1,3 +1,5 @@
+import asyncio
+import builtins
 import concurrent.futures
 import io
 import os
@@ -9,6 +11,7 @@ from unittest import mock
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
+import aiohttp
 import fsspec.asyn
 import fsspec.core
 import pytest
@@ -37,11 +40,26 @@ TEST_PROJECT = gcsfs.tests.settings.TEST_PROJECT
 TEST_REQUESTER_PAYS_BUCKET = gcsfs.tests.settings.TEST_REQUESTER_PAYS_BUCKET
 TEST_KMS_KEY = gcsfs.tests.settings.TEST_KMS_KEY
 
+# Test placement: keep common behavior and standard-bucket coverage in this
+# file. HNS-specific filesystem behavior belongs in test_extended_hns_gcsfs.py
+# or integration/test_extended_hns.py; zonal-specific behavior belongs in
+# test_zonal_file.py.
+
 
 def test_simple(gcs, monkeypatch):
     monkeypatch.setattr(GoogleCredentials, "tokens", None)
     gcs.ls(TEST_BUCKET)  # no error
     gcs.ls("/" + TEST_BUCKET)  # OK to lead with '/'
+
+
+def test_gcs_init_invalid_access():
+    with pytest.raises(ValueError) as excinfo:
+        GCSFileSystem(access="invalid_access_value", token="anon")
+    msg = str(excinfo.value)
+    assert msg.startswith("access must be one of {")
+    assert msg.endswith("}")
+    for scope in GCSFileSystem.scopes:
+        assert f"'{scope}'" in msg or f'"{scope}"' in msg
 
 
 def test_exists(gcs):
@@ -543,6 +561,45 @@ async def test_rm_batch_error(gcs):
         assert len(out) == 1
         assert isinstance(out[0], OSError)
         assert f"{path}: 400" in str(out[0])
+
+
+@pytest.mark.asyncio
+async def test_rm_batch_not_found_invalidates_stale_cache(gcs):
+    parent = TEST_BUCKET + "/cached"
+    path = parent + "/already_gone"
+    gcs.dircache[parent] = [{"name": path, "type": "file"}]
+    is_hns = (
+        await gcs._is_bucket_hns_enabled(TEST_BUCKET)
+        if hasattr(gcs, "_is_bucket_hns_enabled")
+        else False
+    )
+
+    boundary = "==========7330845974216740156=="
+    mock_response_content = (
+        f"\n--{boundary}\n"
+        "Content-Type: application/http\n"
+        "\n"
+        "HTTP/1.1 404 Not Found\n"
+        "Content-Type: application/json\n"
+        "\n"
+        '{"error": {"code": 404, "message": "No such object"}}\n'
+        f"--{boundary}--\n"
+    ).encode()
+    mock_headers = {"Content-Type": f"multipart/mixed; boundary={boundary}"}
+
+    with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        mock_call.return_value = (mock_headers, mock_response_content)
+
+        out = await gcs._rm_files([path])
+
+        assert len(out) == 1
+        assert isinstance(out[0], OSError)
+        assert "No such object" in str(out[0])
+        if is_hns:
+            assert parent in gcs.dircache
+            assert path not in [entry["name"] for entry in gcs.dircache[parent]]
+        else:
+            assert parent not in gcs.dircache
 
 
 def test_rm_recursive(gcs):
@@ -1418,7 +1475,10 @@ async def test_upload_chunk_shortfall():
     args2, kwargs2 = call_args_list[1]
     assert kwargs2["headers"]["Content-Range"] == "bytes 5-9/10"
 
-    assert kwargs2["data"].getvalue() == b"56789"
+    sent_data = kwargs2["data"]
+    if hasattr(sent_data, "getvalue"):
+        sent_data = sent_data.getvalue()
+    assert sent_data == b"56789"
 
 
 @pytest.mark.parametrize("protocol", ["", "gs://", "gcs://"])
@@ -1538,7 +1598,7 @@ def test_errors(gcs):
 
 def test_read_small(gcs):
     fn = TEST_BUCKET + "/2014-01-01.csv"
-    with gcs.open(fn, "rb", block_size=10) as f:
+    with gcs.open(fn, "rb", block_size=10, cache_type="readahead") as f:
         out = []
         while True:
             data = f.read(3)
@@ -1665,7 +1725,7 @@ def test_readline_from_cache(gcs):
     with gcs.open(a, "wb") as f:
         f.write(data)
 
-    with gcs.open(a, "rb") as f:
+    with gcs.open(a, "rb", cache_type="readahead") as f:
         result = f.readline()
         assert result == b"a,b\n"
         assert f.loc == 4
@@ -2450,6 +2510,31 @@ def test_copy_cache_invalidated(gcs):
     assert gcs.isfile(target_file2)
 
 
+def test_write_file_cache_invalidates_only_immediate_parent_standard(gcs, flat_bucket):
+    """Standard buckets use the write-cache shortcut when the parent is cached."""
+    base_dir = f"{flat_bucket}/write_cache_std_{uuid.uuid4().hex}"
+    parent_dir = f"{base_dir}/parent"
+    sibling_dir = f"{base_dir}/sibling"
+    new_file = f"{parent_dir}/new.txt"
+
+    gcs.touch(f"{parent_dir}/existing.txt")
+    gcs.touch(f"{sibling_dir}/sibling_file.txt")
+
+    gcs.ls(base_dir)
+    gcs.ls(parent_dir)
+    gcs.ls(sibling_dir)
+    assert base_dir in gcs.dircache
+    assert parent_dir in gcs.dircache
+    assert sibling_dir in gcs.dircache
+
+    gcs.pipe_file(new_file, b"hello world")
+
+    assert parent_dir not in gcs.dircache
+    assert base_dir in gcs.dircache
+    assert sibling_dir in gcs.dircache
+    assert new_file in gcs.ls(parent_dir, detail=False)
+
+
 def test_transaction(gcs):
     # https://github.com/fsspec/gcsfs/issues/389
     if not gcs.on_google:
@@ -2620,13 +2705,12 @@ def test_mv_file_raises_error_for_specific_generation(gcs):
         gcs.version_aware = original_version_aware
 
 
-def test_cat_file_routing_and_thresholds(gcs):
+def test_cat_file_routing_and_thresholds(gcs, monkeypatch):
+    monkeypatch.setattr(gcs, "MIN_CHUNK_SIZE_FOR_CONCURRENCY", 5)
     fn = f"{TEST_BUCKET}/core_routing.txt"
-    # Create an 8MB file
-    data = os.urandom(8 * 1024 * 1024)
+    data = b"0123456789abcdefghijk"
     gcs.pipe(fn, data)
 
-    # 1. Concurrency = 1 (Should route to sequential)
     with mock.patch.object(
         gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
     ) as mock_seq:
@@ -2640,7 +2724,6 @@ def test_cat_file_routing_and_thresholds(gcs):
             assert mock_seq.call_count == 1
             assert mock_conc.call_count == 0
 
-    # 2. Concurrency = 4, but read size (1MB) is < MIN_CHUNK_SIZE_FOR_CONCURRENCY (5MB)
     with mock.patch.object(
         gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
     ) as mock_seq:
@@ -2648,23 +2731,24 @@ def test_cat_file_routing_and_thresholds(gcs):
             gcs, "_cat_file_concurrent", wraps=gcs._cat_file_concurrent
         ) as mock_conc:
             res = fsspec.asyn.sync(
-                gcs.loop, gcs._cat_file, fn, start=0, end=1024 * 1024, concurrency=4
+                gcs.loop, gcs._cat_file, fn, start=0, end=4, concurrency=4
             )
-            assert res == data[: 1024 * 1024]
-            # It hits the concurrent wrapper, but bails out to sequential internally
+            assert res == data[:4]
             assert mock_conc.call_count == 1
             assert mock_seq.call_count == 1
 
-    # 3. Concurrency = 4, and read size (8MB) >= MIN_CHUNK_SIZE_FOR_CONCURRENCY (5MB)
     with mock.patch.object(
         gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
     ) as mock_seq:
         res = fsspec.asyn.sync(
-            gcs.loop, gcs._cat_file, fn, start=0, end=8 * 1024 * 1024, concurrency=4
+            gcs.loop, gcs._cat_file, fn, start=0, end=len(data), concurrency=4
         )
         assert res == data
-        # Should call sequential 4 times (once for each concurrent chunk)
         assert mock_seq.call_count == 4
+        assert [
+            (call.kwargs["start"], call.kwargs["end"])
+            for call in mock_seq.call_args_list
+        ] == [(0, 5), (5, 10), (10, 15), (15, 21)]
 
 
 def test_cat_file_concurrent_data_integrity(gcs):
@@ -2678,6 +2762,31 @@ def test_cat_file_concurrent_data_integrity(gcs):
     )
     assert len(res) == file_size
     assert res == data
+
+
+def test_cat_file_concurrent_caps_tasks(gcs, monkeypatch):
+    monkeypatch.setattr(gcs, "MIN_CHUNK_SIZE_FOR_CONCURRENCY", 5)
+    fn = f"{TEST_BUCKET}/core_capped_concurrency.txt"
+    data = b"0123456789abcdefghij"
+    gcs.pipe(fn, data)
+
+    with mock.patch.object(
+        gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
+    ) as mock_seq:
+        res = fsspec.asyn.sync(
+            gcs.loop,
+            gcs._cat_file_concurrent,
+            fn,
+            start=0,
+            end=len(data),
+            concurrency=1000,
+        )
+        assert res == data
+        assert mock_seq.call_count == 4
+        assert [
+            (call.kwargs["start"], call.kwargs["end"])
+            for call in mock_seq.call_args_list
+        ] == [(0, 5), (5, 10), (10, 15), (15, 20)]
 
 
 def test_cat_file_concurrent_exception_cancellation(gcs):
@@ -2704,13 +2813,47 @@ def test_cat_file_concurrent_exception_cancellation(gcs):
             )
 
 
-def test_gcsfile_prefetch_disabled_fallback(gcs):
-    """Verify that omitting the flag entirely skips the prefetcher initialization."""
-    fn = f"{TEST_BUCKET}/no_prefetch.txt"
+def test_gcsfile_prefetch_and_cache_type_rules(gcs):
+    """Verify that prefetcher is only used when cache_type is not set by user, and default cache_type is 'none'."""
+    fn = f"{TEST_BUCKET}/cache_rules.txt"
     gcs.pipe(fn, b"HelloWorld")
 
+    # 1. Default: cache_type is not set -> prefetcher active, cache_type is "none", cache_source is "default"
+    with gcs.open(fn, "rb") as f:
+        assert getattr(f, "_prefetch_engine", None) is not None
+        assert f.cache_type == "none"
+        assert f.cache_source == "default"
+        assert f.read() == b"HelloWorld"
+
+    # 2. Prefetcher disabled, no cache_type set -> no prefetcher, cache_type falls back to "readahead",
+    # cache_source is "default"
     with gcs.open(fn, "rb", use_experimental_adaptive_prefetching=False) as f:
         assert getattr(f, "_prefetch_engine", None) is None
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "default"
+        assert f.read() == b"HelloWorld"
+
+    # 3. User sets cache_type="readahead" -> prefetcher NOT used, cache_type is "readahead", cache_source is "explicit"
+    with gcs.open(fn, "rb", cache_type="readahead") as f:
+        assert getattr(f, "_prefetch_engine", None) is None
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "explicit"
+        assert f.read() == b"HelloWorld"
+
+    # 4. User sets cache_type="readahead" even with prefetcher=True -> prefetcher NOT used, cache_source is "explicit"
+    with gcs.open(
+        fn, "rb", cache_type="readahead", use_experimental_adaptive_prefetching=True
+    ) as f:
+        assert getattr(f, "_prefetch_engine", None) is None
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "explicit"
+        assert f.read() == b"HelloWorld"
+
+    # 5. User explicitly sets cache_type="none" -> prefetcher NOT used, cache_source is "explicit"
+    with gcs.open(fn, "rb", cache_type="none") as f:
+        assert getattr(f, "_prefetch_engine", None) is None
+        assert f.cache_type == "none"
+        assert f.cache_source == "explicit"
         assert f.read() == b"HelloWorld"
 
 
@@ -3101,6 +3244,304 @@ async def test_info_parallel_dir_first(gcs):
         assert mock_get_dir.call_count == 1
 
 
+def test_get_file_routing_and_thresholds(gcs):
+    """Test that get_file correctly routes to sequential or concurrent paths based on size thresholds."""
+    fn = f"{TEST_BUCKET}/get_routing.txt"
+    # Create an 8MB file
+    data = os.urandom(8 * 1024 * 1024)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out.txt")
+
+        with (
+            mock.patch.object(
+                gcs, "_get_file_request", wraps=gcs._get_file_request
+            ) as mock_req,
+            mock.patch.object(
+                gcs, "_get_file_concurrent", wraps=gcs._get_file_concurrent
+            ) as mock_conc,
+        ):
+
+            # 1. Concurrency = 1 (Should route directly to sequential)
+            gcs.get_file(fn, lpath, concurrency=1)
+            assert open(lpath, "rb").read() == data
+            assert mock_req.call_count == 1
+            assert mock_conc.call_count == 0
+
+            mock_req.reset_mock()
+            mock_conc.reset_mock()
+            os.remove(lpath)
+
+            # 2. Standard Bucket (100MB threshold)
+            # 8MB is < 100MB, so it should gracefully fall back to sequential internally
+            with mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=100 * 1024 * 1024,
+            ):
+                gcs.get_file(fn, lpath, concurrency=4)
+                assert open(lpath, "rb").read() == data
+                assert mock_conc.call_count == 1
+                assert mock_req.call_count == 1
+
+            mock_req.reset_mock()
+            mock_conc.reset_mock()
+            os.remove(lpath)
+
+            # 3. Zonal Bucket (5MB threshold)
+            # 8MB is >= 5MB, so it should fully execute via the concurrent prefetcher logic
+            with mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=5 * 1024 * 1024,
+            ):
+                gcs.get_file(fn, lpath, concurrency=4)
+                assert open(lpath, "rb").read() == data
+                assert mock_conc.call_count == 1
+                assert mock_req.call_count == 0
+
+
+def test_get_file_concurrent_data_integrity(gcs):
+    """Test that the concurrent file fetch stitches blocks together correctly."""
+    fn = f"{TEST_BUCKET}/get_integrity.txt"
+    file_size = 20 * 1024 * 1024  # 20MB (larger than 5MB default)
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_integrity.txt")
+
+        # Lower threshold to force true concurrency (no longer modifying MIN_CHUNK_SIZE_FOR_CONCURRENCY)
+        with mock.patch.object(
+            gcs,
+            "_get_threshold_for_disk_reads",
+            new_callable=mock.AsyncMock,
+            return_value=5 * 1024 * 1024,
+        ):
+            gcs.get_file(fn, lpath, concurrency=4, chunk_size=5 * 1024 * 1024)
+
+        assert os.path.getsize(lpath) == file_size
+        with open(lpath, "rb") as f:
+            assert f.read() == data
+
+
+def test_get_file_concurrent_exception_cancellation(gcs):
+    """Ensure that if a chunk fails during concurrent download, the exception is raised and file is cleaned up."""
+    fn = f"{TEST_BUCKET}/get_exception.txt"
+    file_size = 10 * 1024 * 1024  # 10MB (larger than 5MB default)
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_exception.txt")
+        original_cat = gcs._cat_file
+
+        async def mock_fail_cat(path, start, end, **kwargs):
+            if (
+                start > 0
+            ):  # Force failure on subsequent chunks, allowing the first chunk to write
+                raise OSError("Simulated Download Error")
+            return await original_cat(path, start, end, **kwargs)
+
+        with mock.patch.object(
+            gcs,
+            "_get_threshold_for_disk_reads",
+            new_callable=mock.AsyncMock,
+            return_value=2 * 1024 * 1024,
+        ):
+            with mock.patch.object(gcs, "_cat_file", side_effect=mock_fail_cat):
+                with pytest.raises(OSError, match="Simulated Download Error"):
+                    gcs.get_file(fn, lpath, concurrency=4, chunk_size=2 * 1024 * 1024)
+
+        # File should be removed by the clean-up block in _get_file
+        assert not os.path.exists(lpath)
+
+
+def test_get_file_concurrent_consistency(gcs):
+    """Ensure concurrent path appropriately invokes the file consistency checker."""
+    fn = f"{TEST_BUCKET}/get_consistency.txt"
+    data = b"consistency test data" * 300000  # ~6.3MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_consistency.txt")
+
+        # Mock the dynamic threshold lookup to 1 byte so it stays concurrent
+        with mock.patch.object(
+            gcs,
+            "_get_threshold_for_disk_reads",
+            new_callable=mock.AsyncMock,
+            return_value=1,
+        ):
+
+            # Mock the internal validate method of the checker
+            with mock.patch(
+                "gcsfs.checkers.MD5Checker.validate_json_response"
+            ) as mock_validate:
+                gcs.get_file(fn, lpath, concurrency=2, consistency="md5")
+                mock_validate.assert_called_once()
+
+
+def test_get_file_concurrent_no_pwrite(gcs):
+    """Coverage: `with open(lpath, "rb+") as f: f.seek(offset); f.write(chunk)`"""
+    fn = f"{TEST_BUCKET}/no_pwrite.txt"
+    data = b"fallback_test_data" * (1024 * 1024)  # ~18MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_no_pwrite.txt")
+
+        # Safely mock `hasattr(os, 'pwrite')` returning False
+        orig_hasattr = builtins.hasattr
+
+        def mock_hasattr(obj, name):
+            if obj is os and name == "pwrite":
+                return False
+            return orig_hasattr(obj, name)
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("builtins.hasattr", side_effect=mock_hasattr),
+        ):
+
+            gcs.get_file(fn, lpath, concurrency=2, chunk_size=10 * 1024 * 1024)
+
+        with open(lpath, "rb") as f:
+            assert f.read() == data
+
+
+def test_get_file_concurrent_early_eof(gcs):
+    """Coverage: integrity check raises ClientError after retries."""
+    fn = f"{TEST_BUCKET}/early_eof.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_early_eof.txt")
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch(
+                "gcsfs.prefetcher.BackgroundPrefetcher.afetch",
+                new_callable=mock.AsyncMock,
+            ) as mock_afetch,
+        ):
+            # Define a function to simulate consistent truncation across retries
+            async def mock_afetch_truncated(start, end):
+                if start == 0:
+                    return b"12345"  # Only return the first 5 bytes
+                return b""  # Return EOF for any subsequent range
+
+            mock_afetch.side_effect = mock_afetch_truncated
+
+            # The function will retry several times, but always fail the integrity check.
+            # We assert that it eventually raises the ClientError.
+            with pytest.raises(
+                aiohttp.ClientError,
+                match="Expected 10485760 bytes, but only received 5 bytes",
+            ):
+                gcs.get_file(fn, lpath, concurrency=2, chunk_size=5)
+
+
+def test_get_file_concurrent_write_exception_in_loop(gcs):
+    """Coverage: `if exceptions: raise exceptions[0]` (Inside the pending loop)"""
+    fn = f"{TEST_BUCKET}/write_exc_loop.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_write_exc_loop.txt")
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("os.pwrite", side_effect=OSError("Disk Full Loop")),
+        ):
+            with pytest.raises(OSError, match="Disk Full Loop"):
+                # Chunk size small to produce many pending_writes and trigger the loop check
+                gcs.get_file(fn, lpath, concurrency=2, chunk_size=5 * 1024 * 1024)
+
+
+def test_get_file_concurrent_write_exception_in_finally(gcs):
+    """Coverage: `if exc: exceptions.append(exc)` (Inside the finally clean-up block)"""
+    fn = f"{TEST_BUCKET}/write_exc_finally.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_write_exc_finally.txt")
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("os.pwrite", side_effect=OSError("Disk Full Finally")),
+        ):
+            with pytest.raises(OSError, match="Disk Full Finally"):
+                gcs.get_file(fn, lpath, concurrency=3, chunk_size=20 * 1024 * 1024)
+
+
+def test_get_file_concurrent_cancelled_error(gcs):
+    """Coverage: `except asyncio.CancelledError: break/pass` inside the finally block"""
+    fn = f"{TEST_BUCKET}/cancelled.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_cancelled.txt")
+
+        # Create a mock that forces the exact exception we are trying to cover
+        async def mock_wait(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("gcsfs.core.asyncio.wait", side_effect=mock_wait),
+        ):
+            gcs.get_file(fn, lpath, concurrency=2, chunk_size=20 * 1024 * 1024)
+
+
+def test_init_local_file(gcs):
+    """Coverage: `if total_size == 0:` inside `_init_local_file`"""
+    with tempdir() as dn:
+        # Cover normal pre-allocation
+        lpath = os.path.join(dn, "prealloc.txt")
+        gcs._init_local_file(lpath, 1024)
+        assert os.path.exists(lpath)
+        assert os.path.getsize(lpath) == 1024
+
+        # Cover zero-size pre-allocation
+        lpath_zero = os.path.join(dn, "zero.txt")
+        gcs._init_local_file(lpath_zero, 0)
+        assert os.path.exists(lpath_zero)
+        assert os.path.getsize(lpath_zero) == 0
+
+
 def test_open_generation_forwarded():
     fs = gcsfs.core.GCSFileSystem()
     with mock.patch("gcsfs.core.GCSFile") as mock_gcs_file:
@@ -3108,3 +3549,164 @@ def test_open_generation_forwarded():
         mock_gcs_file.assert_called_once()
         _, kwargs = mock_gcs_file.call_args
         assert kwargs.get("generation") == "123"
+
+
+@pytest.mark.asyncio
+async def test_cat_file_generation():
+    fs = gcsfs.core.GCSFileSystem(token="anon")
+
+    with mock.patch.object(fs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        with mock.patch.object(
+            fs, "_process_limits", new_callable=mock.AsyncMock
+        ) as mock_limits:
+            mock_limits.return_value = "bytes=0-10"
+            mock_call.return_value = ({}, b"data")
+
+            await fs._cat_file_sequential(
+                "bucket/file", start=0, end=10, generation="12345"
+            )
+
+            assert mock_call.call_count == 1
+            url = mock_call.call_args[0][1]
+            assert "generation=12345" in url
+
+
+def test_file_url_generation():
+    fs = gcsfs.core.GCSFileSystem(token="anon")
+    f = gcsfs.core.GCSFile(fs, "bucket/file", mode="wb")
+    f.generation = "12345"
+
+    try:
+        assert f.url() == fs.url("bucket/file", generation="12345")
+        assert "generation=12345" in f.url()
+    finally:
+        # Avoid flushing the unused write buffer (and a network call) on GC.
+        f.closed = True
+
+
+def test_get_cache_type_header_value():
+    from gcsfs.core import _get_cache_type_header_value
+
+    # Explicit source
+    assert _get_cache_type_header_value("none", "explicit") == "cache_type/none:e"
+    assert (
+        _get_cache_type_header_value("readahead", "explicit")
+        == "cache_type/readahead:e"
+    )
+    assert _get_cache_type_header_value("mmap", "explicit") == "cache_type/mmap:e"
+
+    # Default source
+    assert _get_cache_type_header_value("none", "default") == "cache_type/none:d"
+    assert (
+        _get_cache_type_header_value("readahead", "default") == "cache_type/readahead:d"
+    )
+
+    # Unspecified / None source (backward compatibility)
+    assert _get_cache_type_header_value("mmap", None) == "cache_type/mmap"
+
+    # None or empty cache_type
+    assert _get_cache_type_header_value(None, "explicit") == ""
+    assert _get_cache_type_header_value("", "explicit") == ""
+    assert _get_cache_type_header_value(None) == ""
+
+
+def test_get_headers_includes_cache_type(gcs):
+    # Test that _get_headers correctly appends cache_type to User-Agent
+    headers_explicit = gcs._get_headers(
+        None, cache_type="test_cache", cache_source="explicit"
+    )
+    assert "cache_type/test_cache:e" in headers_explicit["User-Agent"]
+    assert "python-gcsfs/" in headers_explicit["User-Agent"]
+
+    headers_default = gcs._get_headers(
+        None, cache_type="test_cache", cache_source="default"
+    )
+    assert "cache_type/test_cache:d" in headers_default["User-Agent"]
+
+    headers_plain = gcs._get_headers(None, cache_type="test_cache")
+    assert "cache_type/test_cache" in headers_plain["User-Agent"]
+    assert (
+        ":e" not in headers_plain["User-Agent"]
+        and ":d" not in headers_plain["User-Agent"]
+    )
+
+    # Test that it doesn't append if cache_type is None
+    headers_none = gcs._get_headers(None, cache_type=None)
+    assert "cache_type/" not in headers_none["User-Agent"]
+    assert headers_none["User-Agent"] == "python-gcsfs/" + version
+
+    # Test that it doesn't override if User-Agent is already present
+    headers_preset = gcs._get_headers(
+        {"User-Agent": "custom-ua"}, cache_type="test_cache", cache_source="explicit"
+    )
+    assert headers_preset["User-Agent"] == "custom-ua"
+
+
+def test_user_agent_includes_cache_type_and_source_in_read(gcs):
+    # TODO(lankita): Remove this skip when User-Agent is updated to include cache_type for gRPC/rapid buckets.
+    # Zonal buckets currently use the gRPC path which does not use the HTTP client.
+    if hasattr(gcs, "_is_zonal_bucket") and sync(
+        gcs.loop, gcs._is_zonal_bucket, TEST_BUCKET
+    ):
+        pytest.skip("Zonal buckets use gRPC, skipping HTTP User-Agent test")
+
+    fn = TEST_BUCKET + "/2014-01-01.csv"
+
+    # 1. Explicit cache_type="mmap" -> User-Agent contains cache_type/mmap:e
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb", block_size=10, cache_type="mmap") as f:
+            out = []
+            while True:
+                data = f.read(3)
+                if data == b"":
+                    break
+                out.append(data)
+            assert gcs.cat(fn) == b"".join(out)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent")
+            for call in mock_session_request.call_args_list
+        ]
+        expected_ua = f"python-gcsfs/{version} cache_type/mmap:e"
+        assert expected_ua in user_agents
+
+    # 2. Default open (prefetcher active) -> User-Agent contains cache_type/none:d
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb") as f:
+            _ = f.read(10)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent", "")
+            for call in mock_session_request.call_args_list
+        ]
+        assert any("cache_type/none:d" in ua for ua in user_agents)
+
+    # 3. Explicit cache_type="none" -> User-Agent contains cache_type/none:e
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb", cache_type="none") as f:
+            _ = f.read(10)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent", "")
+            for call in mock_session_request.call_args_list
+        ]
+        assert any("cache_type/none:e" in ua for ua in user_agents)
+
+    # 4. Prefetcher disabled fallback -> User-Agent contains cache_type/readahead:d
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb", use_experimental_adaptive_prefetching=False) as f:
+            _ = f.read(10)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent", "")
+            for call in mock_session_request.call_args_list
+        ]
+        assert any("cache_type/readahead:d" in ua for ua in user_agents)
