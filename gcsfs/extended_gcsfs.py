@@ -1515,102 +1515,55 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     rmdir = asyn.sync_wrapper(_rmdir)
 
-    # TODO: This method is only added to be used in rm method, can be deleted once
-    # rm method is integrated with recursive API
-    async def _expand_path_with_details(
-        self, path, recursive=False, maxdepth=None, detail=False, assume_literal=False
-    ):
+    async def _delete_folder_recursive(self, path):
         """
-        Expand path with details, similar to `_expand_path` but returning full details.
-
-        This method is used in `_rm` to get a list of files and directories to delete.
-        It handles special characters in filenames by avoiding re-globbing concrete paths
-        found during recursive expansion.
-
-        Parameters
-        ----------
-        path : str or list
-            The path or list of paths to expand.
-        recursive : bool, default False
-            Whether to recursively expand directories.
-        maxdepth : int, optional
-            Maximum depth to traverse for expansion.
-        detail : bool, default False
-            If True, returns a list of dictionaries with file details;
-            otherwise, returns a list of path strings.
-        assume_literal : bool, default False
-            If True, treats the paths as literal even if they contain magic characters.
-            This is used in recursive calls to prevent re-globbing concrete paths.
+        Recursively deletes a directory and all its contents in an HNS-enabled
+        bucket using the Storage Control `delete_folder_recursive` API.
         """
-        if maxdepth is not None and maxdepth < 1:
-            raise ValueError("maxdepth must be at least 1")
+        path = self._strip_protocol(path).rstrip("/")
+        bucket, key, _ = self.split_path(path)
 
-        if isinstance(path, str):
-            return await self._expand_path_with_details(
-                [path],
-                recursive,
-                maxdepth,
-                detail=detail,
-                assume_literal=assume_literal,
+        if not key:
+            return await super()._rmdir(path)
+
+        try:
+            logger.debug(f"Using HNS delete_folder_recursive for '{path}'.")
+            folder_name = f"projects/_/buckets/{bucket}/folders/{key.rstrip('/')}"
+            request = storage_control_v2.DeleteFolderRecursiveRequest(
+                name=folder_name,
+                request_id=str(uuid.uuid4()),
             )
-        else:
-            out = {} if detail else set()
-            path = [self._strip_protocol(p) for p in path]
 
-            for p in path:
-                if not assume_literal and has_magic(p):
-                    bit = await self._glob(p, maxdepth=maxdepth, detail=detail)
-                    if detail:
-                        out.update(bit)
-                        bit_paths = list(bit.keys())
-                    else:
-                        bit_set = set(bit)
-                        out |= bit_set
-                        bit_paths = list(bit_set)
+            logger.debug(f"delete_folder_recursive request: {request}")
+            client = await self._get_control_plane_client()
+            operation = await client.delete_folder_recursive(
+                request=request,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            )
+            await operation.result()
 
-                    if recursive:
-                        if maxdepth is not None and maxdepth <= 1:
-                            continue
-                        rec = await self._expand_path_with_details(
-                            bit_paths,
-                            recursive=recursive,
-                            maxdepth=maxdepth - 1 if maxdepth is not None else None,
-                            detail=detail,
-                            assume_literal=True,
-                        )
-                        if detail:
-                            for info in rec:
-                                out[info["name"]] = info
-                        else:
-                            out |= set(rec)
-                    continue
-                elif recursive:
-                    rec = await self._find(
-                        p, maxdepth=maxdepth, withdirs=True, detail=detail
-                    )
-                    if detail:
-                        out.update(rec)
-                    else:
-                        out |= set(rec)
-
-                if p not in out:
-                    if detail:
-                        try:
-                            info = await self._info(p)
-                            out[p] = info
-                        except (FileNotFoundError, OSError):
-                            pass
-                    elif recursive is False or (await self._exists(p)):
-                        out.add(p)
-
-            if detail:
-                out = list(out.values())
-            else:
-                out = sorted(out)
-
-        if not out:
-            raise FileNotFoundError(path)
-        return out
+            # Remove the directory and all its descendants from the cache, and
+            # remove the deleted directory entry from its parent's listing.
+            prefix = f"{path}/"
+            for cache_key in list(self.dircache):
+                if cache_key == path or cache_key.startswith(prefix):
+                    self.dircache.pop(cache_key, None)
+            self._cache_drop_entries(self._parent(path), {path})
+            return
+        except api_exceptions.NotFound as e:
+            raise FileNotFoundError(
+                f"delete_folder_recursive failed for path: {path}: {e}"
+            ) from e
+        except api_exceptions.FailedPrecondition as e:
+            raise OSError(
+                f"Pre condition failed for delete_folder_recursive for path: {path}: {e}"
+            ) from e
+        except Exception as e:
+            logger.error(
+                f"HNS delete_folder_recursive: Failed to delete folder '{path}': {e}"
+            )
+            raise
 
     async def _rm(self, path, recursive=False, maxdepth=None, batchsize=20):
         """
@@ -1623,9 +1576,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         This means a single call may mix paths from HNS and flat buckets, and
         the per-bucket groups are deleted concurrently.
 
-        For HNS buckets, it first expands the path to get a list of all files
-        and directories, then categorizes them. It deletes files in batches
-        and then deletes directories individually.
+        For HNS buckets, directories are deleted recursively using the Storage
+        Control `delete_folder_recursive` API when `recursive=True`, or via
+        `_rmdir` when `recursive=False`, while files are deleted in batches.
 
         Args:
             path (str or list): The path(s) to delete.
@@ -1692,57 +1645,103 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 path, recursive=recursive, maxdepth=maxdepth, batchsize=batchsize
             )
 
-        paths = await self._expand_path_with_details(
-            path, recursive=recursive, maxdepth=maxdepth, detail=True
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+
+        targets = {}
+        for p in [self._strip_protocol(p) for p in path]:
+            if has_magic(p):
+                targets.update(await self._glob(p, maxdepth=maxdepth, detail=True))
+                continue
+
+            _, key, _ = self.split_path(p)
+            if recursive and not key:
+                try:
+                    for entry in await self._ls(p, detail=True):
+                        targets[entry["name"]] = entry
+                except (FileNotFoundError, OSError):
+                    pass
+
+            try:
+                info = await self._info(p)
+                targets[info["name"]] = info
+            except (FileNotFoundError, OSError):
+                pass
+
+        files = [t["name"] for t in targets.values() if t["type"] == "file"]
+        dirs = [t["name"] for t in targets.values() if t["type"] == "directory"]
+
+        return await self._perform_rm(
+            files, dirs, path, batchsize=batchsize, recursive=recursive
         )
 
-        # Separate files and directories based on their type. Directories are
-        # sorted in reverse so they are deleted from the deepest first.
-        files = list({p["name"] for p in paths if p["type"] == "file"})
-        dirs = sorted(
-            {p["name"] for p in paths if p["type"] == "directory"},
-            reverse=True,
-        )
-
-        return await self._perform_rm(files, dirs, path, batchsize=batchsize)
-
-    async def _perform_rm(self, files, dirs, path, batchsize):
+    async def _perform_rm(self, files, dirs, path, batchsize, recursive=False):
         """
         Helper method to perform the deletion of files and directories.
 
         Args:
             files (list[str]): A list of file paths to delete.
-            dirs (list[str]): A list of directory paths to delete, sorted from
-                              deepest to shallowest.
-            path (str): The original path for the rm operation, for error reporting.
-            batchsize (int): The number of files to delete in a single batch request.
+            dirs (list[str]): A list of directory paths to delete.
+            path (str or list): The original path(s) for the rm operation.
+            batchsize (int): The number of items to delete in a single batch.
+            recursive (bool): If True, deletes directories recursively via
+                `_delete_folder_recursive`; otherwise deletes empty directories
+                via `_rmdir`.
 
         Returns:
             list: A list of exceptions that occurred during deletion.
         """
-        # If no files or directories were found to delete, raise FileNotFoundError.
         if not files and not dirs:
             raise FileNotFoundError(path)
 
-        exs = await self._delete_files(files, batchsize)
-        # For directories, we must delete them from deepest to shallowest
-        # to avoid race conditions where a parent is deleted before its child.
-        # We group directories by depth and delete them level by level.
-        dirs_by_depth = {}
-        for d in dirs:
-            depth = d.count("/")
-            dirs_by_depth.setdefault(depth, []).append(d)
+        if recursive and dirs:
+            bucket_dirs = []
+            folder_dirs = []
+            for d in sorted(dirs):
+                _, key, _ = self.split_path(d)
+                if not key:
+                    bucket_dirs.append(d)
+                elif not any(d.startswith(f"{top.rstrip('/')}/") for top in folder_dirs):
+                    folder_dirs.append(d)
 
-        for depth in sorted(dirs_by_depth.keys(), reverse=True):
-            level_dirs = dirs_by_depth[depth]
-            results = await asyn._run_coros_in_chunks(
-                [self._rmdir(d) for d in level_dirs],
-                batch_size=batchsize,
-                return_exceptions=True,
-            )
-            for res in results:
-                if isinstance(res, Exception):
-                    exs.append(res)
+            if folder_dirs:
+                files = [
+                    f
+                    for f in files
+                    if not any(
+                        f.startswith(f"{top.rstrip('/')}/") for top in folder_dirs
+                    )
+                ]
+
+            exs = await self._delete_files(files, batchsize) if files else []
+
+            if folder_dirs:
+                exs.extend(
+                    await asyn._run_coros_in_chunks(
+                        [self._delete_folder_recursive(d) for d in folder_dirs],
+                        batch_size=batchsize,
+                        return_exceptions=True,
+                    )
+                )
+
+            if bucket_dirs:
+                exs.extend(
+                    await asyn._run_coros_in_chunks(
+                        [self._rmdir(b) for b in bucket_dirs],
+                        batch_size=batchsize,
+                        return_exceptions=True,
+                    )
+                )
+        else:
+            exs = await self._delete_files(files, batchsize) if files else []
+            if dirs:
+                exs.extend(
+                    await asyn._run_coros_in_chunks(
+                        [self._rmdir(d) for d in dirs],
+                        batch_size=batchsize,
+                        return_exceptions=True,
+                    )
+                )
 
         errors = [
             ex
@@ -1755,8 +1754,6 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         if errors:
             raise errors[0]
 
-        # Filter out non-critical "not found" errors from the final list.
-        # A successful rm should return an empty list.
         return [
             e
             for e in exs
