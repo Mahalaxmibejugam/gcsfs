@@ -4,15 +4,17 @@ common:
     - "hns"
 
 scenarios:
-  - name: "delete_flat"
-    folders: [1024]
-    files: [131072]
+  - name: "delete_fsdp_checkpoint_rank_folders"
+    depth: 2
+    folders: [32]
+    files: [10000]
 
-  - name: "delete_flat_1"
-    folders: [1024]
-    files: [131072]
+  - name: "delete_fsdp_checkpoint_rank_folders_1"
+    depth: 2
+    folders: [32]
+    files: [10000]
 
-  - name: "delete_flat_2"
-    folders: [1024]
-    files: [131072]
-
+  - name: "delete_fsdp_checkpoint_rank_folders_2"
+    depth: 2
+    folders: [32]
+    files: [10000]
