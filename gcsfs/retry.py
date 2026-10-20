@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 
 import aiohttp.client_exceptions
 import google.auth.exceptions
@@ -16,6 +17,19 @@ DEFAULT_RETRY_CONFIG = {
     "initial": 1.0,
     "maximum": 60.0,
     "multiplier": 2.0,
+}
+
+# Default minimum backoff sleep duration for long-running operations (50ms).
+DEFAULT_LRO_POLL_MIN = 0.05
+# Default maximum backoff sleep duration cap for long-running operations (30s).
+DEFAULT_LRO_POLL_MAX = 30.0
+# Default elapsed time at which the delay reaches DEFAULT_LRO_POLL_MAX (10 minutes).
+DEFAULT_LRO_POLL_CAP_TIME = 600.0
+
+DEFAULT_LRO_POLL_CONFIG = {
+    "min_delay": DEFAULT_LRO_POLL_MIN,
+    "max_delay": DEFAULT_LRO_POLL_MAX,
+    "cap_time": DEFAULT_LRO_POLL_CAP_TIME,
 }
 
 
@@ -247,3 +261,71 @@ def get_storage_control_retry_config(base_config=None, **kwargs) -> AsyncRetry:
     retry_kwargs.update(overrides)
 
     return AsyncRetry(predicate=_is_transient_exception, **retry_kwargs)
+
+
+async def poll_lro(operation, poll_config=None, retry=None):
+    """
+    Polls a Long-Running Operation (LRO) using a time-based linear delay
+    schedule, starting at 50ms and scaling proportionally up to 30s over
+    10 minutes with ±10% multiplicative jitter.
+    """
+    cfg = DEFAULT_LRO_POLL_CONFIG.copy()
+    if poll_config:
+        cfg.update(
+            {k: v for k, v in poll_config.items() if k in cfg and v is not None}
+        )
+
+    min_delay = cfg["min_delay"]
+    max_delay = cfg["max_delay"]
+    cap_time = cfg["cap_time"]
+
+    if min_delay < 0:
+        raise ValueError("min sleep duration must be non-negative")
+    if max_delay <= 0:
+        raise ValueError("max sleep duration must be greater than 0")
+    if min_delay > max_delay:
+        raise ValueError("min sleep duration must not exceed max sleep duration")
+    if cap_time <= 0:
+        raise ValueError("cap time must be greater than 0")
+
+    retry_kwargs = {"retry": retry} if retry is not None else {}
+
+    # Poll #0: Immediate status check right after operation creation to handle
+    # instantaneous completions.
+    try:
+        if await operation.done(**retry_kwargs):
+            return await operation.result()
+    except Exception as err:
+        if not _is_transient_exception(err):
+            raise
+        # On transient errors (e.g. 429), fall through and let the normal
+        # polling loop take over.
+
+    start_time = time.monotonic()
+
+    # slope represents the rate of increase of the delay interval per unit of
+    # elapsed time. It is used to calculate a time-based linear delay schedule:
+    # delay(t) = slope * elapsed_t, growing the delay from 0 up to max_delay
+    # over the duration of cap_time.
+    slope = max_delay / cap_time
+
+    while True:
+        elapsed = time.monotonic() - start_time
+        delay = min(max_delay, max(min_delay, slope * elapsed))
+        # Apply ±10% multiplicative jitter (0.9x to 1.1x of the computed delay)
+        # to prevent synchronized retries from multiple operations hitting the
+        # API at the same time.
+        jitter_factor = 0.9 + 0.2 * random.random()
+        pause = delay * jitter_factor
+
+        await asyncio.sleep(pause)
+
+        try:
+            if await operation.done(**retry_kwargs):
+                return await operation.result()
+        except Exception as err:
+            if not _is_transient_exception(err):
+                raise
+            # On transient errors (e.g. 429), ignore and proceed to sleep for
+            # the next retry interval.
+

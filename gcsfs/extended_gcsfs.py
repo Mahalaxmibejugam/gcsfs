@@ -38,7 +38,11 @@ from gcsfs.core import (
     _location,
     _resolve_generation_match,
 )
-from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
+from gcsfs.retry import (
+    DEFAULT_RETRY_CONFIG,
+    get_storage_control_retry_config,
+    poll_lro,
+)
 from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
 
@@ -1129,7 +1133,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                     retry=self._get_retry_config(),
                     timeout=STORAGE_CONTROL_RPC_TIMEOUT,
                 )
-                await operation.result()
+                await poll_lro(operation, retry=self._get_retry_config())
                 self._update_dircache_after_rename(path1, path2)
 
                 logger.debug(
@@ -1541,7 +1545,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 retry=self._get_retry_config(),
                 timeout=STORAGE_CONTROL_RPC_TIMEOUT,
             )
-            await operation.result()
+            await poll_lro(operation, retry=self._get_retry_config())
 
             # Remove the directory and all its descendants from the cache, and
             # remove the deleted directory entry from its parent's listing.
